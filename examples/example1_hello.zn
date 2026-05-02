@@ -1,0 +1,22 @@
+###
+Example 1: Hello World and Basic Functions
+
+This example demonstrates:
+- Main function entry point
+- Function definition and calling
+- Basic output with txtout()
+- Program exit with out()
+###
+
+func int add(int a, int b) {
+    return a + b;
+}
+
+func int main() {
+    txtout("Hello, Zinc!");
+    
+    result is add(5, 3);
+    txtout(result);
+    
+    out(0);
+}

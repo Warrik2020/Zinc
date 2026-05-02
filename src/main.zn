@@ -1,0 +1,587 @@
+import("../Zinc-Standard-Lib/FileIO.zn");
+import("../Zinc-Standard-Lib/VecToken.zn");
+import("../Zinc-Standard-Lib/VecInt.zn");
+import("../Zinc-Standard-Lib/String.zn");
+import("lexer.zn");
+import("codegen.zn");
+
+func int streq(string a, string b) { return __zinc_rt_strcmp(a, b) == 0; }
+func string rt_strdup(string s) { return __zinc_rt_strdup(s); }
+
+func int str_as_int(string s) { return s; }
+func string int_as_str(int p) { return p; }
+
+# Used to enable tracing in helper functions (avoid threading `debug` everywhere).
+g_debug is 0;
+
+# Wrappers around stdlib string allocators so this unit can be typechecked standalone.
+# (Header `import(...)` directives are stripped, so `substr_copy`/`strdup_copy` are otherwise "unknown".)
+func string zn_substr_copy(string s, int start, int n) { return substr_copy(s, start, n); }
+func string zn_strdup_copy(string s) { return strdup_copy(s); }
+func string zn_file_read_all(string path) { return file_read_all(path); }
+
+func void dbg_free_string(int debug, string label, string p) {
+    if (debug == 1) { txtout("DBG: free(string) ", label, " ptr=", str_as_int(p)); txtout_nl(); }
+    free(p);
+}
+
+func void dbg_free_ptr(int debug, string label, int p) {
+    if (debug == 1) { txtout("DBG: free(ptr) ", label, " ptr=", p); txtout_nl(); }
+    free(p);
+}
+
+# Driver stage logging (prints newline for flush).
+func void dbg(string msg) {
+    if (g_debug == 1) { txtout("DBG: ", msg); txtout_nl(); }
+}
+func void dbg_i(string msg, int v) {
+    if (g_debug == 1) { txtout("DBG: ", msg, v); txtout_nl(); }
+}
+func void dbg_s(string msg, string s) {
+    if (g_debug == 1) { txtout("DBG: ", msg, s); txtout_nl(); }
+}
+
+# Local copies of tiny helpers from `zinc-standard-lib/Process.zn`.
+# We keep them here so `src-zn/main.zn` can be typechecked standalone (imports are stripped).
+func int c_strlen(string s) { return __zinc_rt_strlen(s); }
+
+func string str_concat2(string a, string b) {
+    la is c_strlen(a);
+    lb is c_strlen(b);
+    n is la + lb;
+
+    out is __zinc_rt_malloc(n + 1);
+    __zinc_rt_memcpy(out + 0, a, la);
+    __zinc_rt_memcpy(out + la, b, lb);
+    __zinc_rt_memset(out + n, 0, 1);
+    return out;
+}
+
+func string str_concat3(string a, string b, string c) {
+    la is c_strlen(a);
+    lb is c_strlen(b);
+    lc is c_strlen(c);
+    n is la + lb + lc;
+
+    out is __zinc_rt_malloc(n + 1);
+    __zinc_rt_memcpy(out + 0, a, la);
+    __zinc_rt_memcpy(out + la, b, lb);
+    __zinc_rt_memcpy(out + la + lb, c, lc);
+    __zinc_rt_memset(out + n, 0, 1);
+    return out;
+}
+
+func string str_concat4(string a, string b, string c, string d) {
+    la is c_strlen(a);
+    lb is c_strlen(b);
+    lc is c_strlen(c);
+    ld is c_strlen(d);
+    n is la + lb + lc + ld;
+
+    out is __zinc_rt_malloc(n + 1);
+    __zinc_rt_memcpy(out + 0, a, la);
+    __zinc_rt_memcpy(out + la, b, lb);
+    __zinc_rt_memcpy(out + la + lb, c, lc);
+    __zinc_rt_memcpy(out + la + lb + lc, d, ld);
+    __zinc_rt_memset(out + n, 0, 1);
+    return out;
+}
+
+func int rt_system(string cmd) { return system(cmd); }
+
+func int is_space_byte(int c) { return c == 32 || c == 9 || c == 13 || c == 10; }
+
+func int ltrim_idx(string s, int start, int end) {
+    i is start;
+    while (i < end && (s[i] == 32 || s[i] == 9 || s[i] == 13)) { i is i + 1; }
+    return i;
+}
+
+func int starts_with_at(string s, int start, int end, string lit) {
+    ln is len(lit);
+    if (start + ln > end) { return 0; }
+    for (int i is 0; i < ln; i is i + 1) {
+        if (s[start + i] != lit[i]) { return 0; }
+    }
+    return 1;
+}
+
+func int find_char(string s, int start, int end, int ch) {
+    for (int i is start; i < end; i is i + 1) {
+        if (s[i] == ch) { return i; }
+    }
+    return -1;
+}
+
+func int contains_substr(string s, string needle) {
+    n is len(s);
+    m is len(needle);
+    if (m <= 0) { return 1; }
+    if (m > n) { return 0; }
+    for (int i is 0; i + m <= n; i is i + 1) {
+        if (starts_with_at(s, i, n, needle) == 1) { return 1; }
+    }
+    return 0;
+}
+
+func string path_dirname(string path) {
+    n is len(path);
+    last_slash is -1;
+    for (int i is 0; i < n; i is i + 1) {
+        if (path[i] == 47) { last_slash is i; }
+    }
+    if (last_slash < 0) { return zn_strdup_copy("."); }
+    if (last_slash == 0) { return zn_strdup_copy("/"); }
+    return zn_substr_copy(path, 0, last_slash);
+}
+
+func string path_stem(string path) {
+    n is len(path);
+    last_slash is -1;
+    for (int i is 0; i < n; i is i + 1) {
+        if (path[i] == 47) { last_slash is i; }
+    }
+    start is last_slash + 1;
+    end is n;
+    for (int i is start; i < n; i is i + 1) {
+        if (path[i] == 46) { end is i; }
+    }
+    return zn_substr_copy(path, start, end - start);
+}
+
+func int vec_str_find(int* vec, string s) {
+    n is VecInt.count(vec);
+    for (int i is 0; i < n; i is i + 1) {
+        curp is VecInt.get(vec, i);
+        if (__zinc_rt_strcmp(int_as_str(curp), s) == 0) { return i; }
+    }
+    return -1;
+}
+
+func string resolve_import_path(string parent_file, string import_path) {
+    # Always return a heap string (so callers can safely free it).
+    if (len(import_path) > 0 && import_path[0] == 47) { return rt_strdup(import_path); } # absolute
+    string dir is path_dirname(parent_file);
+    string tmp is str_concat3(dir, "/", import_path);
+    dbg_free_string(0, "dirname", dir);
+    return tmp;
+}
+
+func void scan_header_and_strip(string abs_path, int* out_is_module, int* out_imports, int* out_stripped) {
+    dbg_s("scan_header_and_strip ", abs_path);
+    # `file_read_all()` returns "" on error, but string equality can be pointer-based
+    # across compilation units. Avoid `src == ""` checks and ensure `src` is heap-owned.
+    fsz is file_get_size(abs_path);
+    if (fsz < 0) {
+        txtout("failed to read file: ", abs_path);
+        out(1);
+    }
+    string src is zn_file_read_all(abs_path);
+    if (len(src) == 0) {
+        # Could be an empty file (size==0) or a failed read that returned "".
+        # Either way, ensure `src` is heap-owned so `free(src)` is always safe.
+        if (fsz > 0) {
+            txtout("failed to read file: ", abs_path);
+            out(1);
+        }
+        src is zn_strdup_copy("");
+    }
+    dbg_i("scan_header_and_strip bytes=", len(src));
+
+    # IMPORTANT: allocate VecInt via malloc so it is treated as a plain pointer (tag=1)
+    # and is NOT automatically freed when this function returns (we return it to caller).
+    imports is __zinc_rt_malloc(24); # VecInt = {data,len,cap} = 3x 8-byte slots
+    VecInt.init(imports);
+
+    string out_src is "";
+    out_src_owned is 0;
+    n is len(src);
+    i is 0;
+
+    still_in_header is 1;
+    in_block_comment is 0;
+    saw_import is 0;
+    is_mod is 0;
+
+    # NOTE: Use `i < n` to avoid an infinite loop when `i == n` (EOF).
+    while (i < n) {
+        line_start is i;
+        while (i < n && src[i] != 10) { i is i + 1; }
+        line_end is i; # exclusive of '\n'
+        if (i < n && src[i] == 10) { i is i + 1; }
+        slice_end is i; # includes '\n' if present
+
+        trim is ltrim_idx(src, line_start, line_end);
+
+        if (still_in_header == 1) {
+            # Toggle ### ... ### block comments (only if line starts with ### after trim).
+            if (starts_with_at(src, trim, line_end, "###") == 1) {
+                in_block_comment is 1 - in_block_comment;
+                string line_txt is zn_substr_copy(src, line_start, slice_end - line_start);
+                string tmp is str_concat2(out_src, line_txt);
+                if (out_src_owned == 1) { free(out_src); }
+                free(line_txt);
+                out_src is tmp;
+                out_src_owned is 1;
+                continue;
+            }
+
+            if (in_block_comment == 1) {
+                string line_txt is zn_substr_copy(src, line_start, slice_end - line_start);
+                string tmp is str_concat2(out_src, line_txt);
+                if (out_src_owned == 1) { free(out_src); }
+                free(line_txt);
+                out_src is tmp;
+                out_src_owned is 1;
+                continue;
+            }
+
+            is_blank is 1;
+            for (int k is trim; k < line_end; k is k + 1) {
+                if (!is_space_byte(src[k])) { is_blank is 0; break; }
+            }
+            is_comment is (trim < line_end && src[trim] == 35);
+
+            if (is_blank == 1 || is_comment == 1) {
+                string line_txt is zn_substr_copy(src, line_start, slice_end - line_start);
+                string tmp is str_concat2(out_src, line_txt);
+                if (out_src_owned == 1) { free(out_src); }
+                free(line_txt);
+                out_src is tmp;
+                out_src_owned is 1;
+                continue;
+            }
+
+            # module(); directive
+            if (starts_with_at(src, trim, line_end, "module") == 1) {
+                # Require module() call (avoid `module Name;` style).
+                open_paren is find_char(src, trim, line_end, 40);
+                close_paren is find_char(src, trim, line_end, 41);
+                if (open_paren >= 0 && close_paren == open_paren + 1) {
+                    if (saw_import == 1) {
+                        txtout("Error: module(); must appear before any import(...) directives in ", abs_path);
+                        out(1);
+                    }
+                    is_mod is 1;
+                    continue; # strip directive line
+                }
+            }
+
+            # import("path"); directive
+            if (starts_with_at(src, trim, line_end, "import") == 1) {
+                open_paren is find_char(src, trim, line_end, 40);
+                if (open_paren >= 0) {
+                    q1 is find_char(src, open_paren + 1, line_end, 34);
+                    if (q1 >= 0) {
+                        q2 is find_char(src, q1 + 1, line_end, 34);
+                        if (q2 >= 0) {
+                            string imp is zn_substr_copy(src, q1 + 1, q2 - (q1 + 1));
+                            VecInt.push(imports, str_as_int(imp)); # freed in resolve_unit()
+                            saw_import is 1;
+                            continue; # strip directive line
+                        }
+                    }
+                }
+            }
+
+            still_in_header is 0;
+        }
+
+        string line_txt is zn_substr_copy(src, line_start, slice_end - line_start);
+        string tmp is str_concat2(out_src, line_txt);
+        if (out_src_owned == 1) { free(out_src); }
+        free(line_txt);
+        out_src is tmp;
+        out_src_owned is 1;
+    }
+
+    # Always return a heap-owned stripped source so cleanup can `free()` unconditionally.
+    if (out_src_owned == 0) {
+        out_src is zn_strdup_copy("");
+        out_src_owned is 1;
+    }
+
+    *out_is_module is is_mod;
+    *out_imports is imports;
+    *out_stripped is out_src;
+    free(src);
+}
+
+func void resolve_unit(string abs_path,
+                      int is_root,
+                      int* paths,
+                      int* states,
+                      int* sources,
+                      int* order) {
+    dbg_s("resolve_unit ", abs_path);
+    idx is vec_str_find(paths, abs_path);
+    if (idx >= 0) {
+        st is VecInt.get(states, idx);
+        if (st == 1) {
+            txtout("Error: circular module dependency at ", abs_path);
+            out(1);
+        }
+        if (st == 2) { return; }
+    } else {
+        # Keep an owned copy of the path string so we can free everything at the end.
+        path_copy is rt_strdup(abs_path);
+        VecInt.push(paths, str_as_int(path_copy));
+        VecInt.push(states, 1);
+        VecInt.push(sources, 0);
+        idx is VecInt.count(paths) - 1;
+    }
+
+    VecInt.set(states, idx, 1);
+
+    is_mod is 0;
+    imports is 0;
+    stripped is "";
+    scan_header_and_strip(abs_path, &is_mod, &imports, &stripped);
+    VecInt.set(sources, idx, str_as_int(stripped));
+    dbg_i("resolve_unit imports=", VecInt.count(imports));
+
+    if (is_root == 0 && is_mod == 0) {
+        txtout("Error: import target is not a module: ", abs_path);
+        out(1);
+    }
+
+    depc is VecInt.count(imports);
+    for (int di is 0; di < depc; di is di + 1) {
+        # Stored import paths are heap-owned; free after use to keep memory bounded.
+        string raw is int_as_str(VecInt.get(imports, di));
+        string dep_abs is resolve_import_path(abs_path, raw);
+        if (file_exists(dep_abs) == false) {
+            txtout("Error: failed to resolve import: ", raw);
+            txtout("  from: ", abs_path);
+            txtout("  tried: ", dep_abs);
+            out(1);
+        }
+        resolve_unit(dep_abs, 0, paths, states, sources, order);
+        free(dep_abs);
+        free(raw);
+    }
+    VecInt.destroy(imports);
+    free(imports);
+
+    VecInt.set(states, idx, 2);
+    VecInt.push(order, idx);
+}
+
+func string build_combined_source(string entry_path) {
+    dbg_s("build_combined_source entry=", entry_path);
+    paths is VecInt();
+    VecInt.init(paths);
+    states is VecInt();
+    VecInt.init(states);
+    sources is VecInt();
+    VecInt.init(sources);
+    order is VecInt();
+    VecInt.init(order);
+
+    resolve_unit(entry_path, 1, paths, states, sources, order);
+
+    string combined is "";
+    combined_owned is 0;
+    n is VecInt.count(order);
+    for (int i is 0; i < n; i is i + 1) {
+        idx is VecInt.get(order, i);
+        unit_src is int_as_str(VecInt.get(sources, idx));
+        string tmp1 is str_concat2(combined, unit_src);
+        if (combined_owned == 1) { free(combined); }
+        combined is tmp1;
+        combined_owned is 1;
+    }
+
+    if (combined_owned == 0) {
+        combined is zn_strdup_copy("");
+        combined_owned is 1;
+    }
+    dbg_i("build_combined_source units=", VecInt.count(paths));
+    dbg_i("build_combined_source bytes=", len(combined));
+
+    # Cleanup per-unit strings and vector buffers (combined source is returned to caller).
+    pathc is VecInt.count(paths);
+    for (int i is 0; i < pathc; i is i + 1) {
+        string p is int_as_str(VecInt.get(paths, i));
+        free(p);
+    }
+    srcc is VecInt.count(sources);
+    for (int i is 0; i < srcc; i is i + 1) {
+        string s is int_as_str(VecInt.get(sources, i));
+        free(s);
+    }
+    VecInt.destroy(paths);
+    VecInt.destroy(states);
+    VecInt.destroy(sources);
+    VecInt.destroy(order);
+    free(paths);
+    free(states);
+    free(sources);
+    free(order);
+
+    return combined;
+}
+
+func int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--debug] [--debug-driver]");
+        out(1);
+    }
+
+    string input is "";
+    string out_asm is "";
+    string out_bin is "a.out";
+    # Default behavior (for stub/tests): dump tokens unless `-o` or `--compile` is provided.
+    dump_toks is 1;
+    debug is 0;
+    emit_asm is 0;
+
+    i is 1;
+    while (i < argc) {
+        if (streq(argv[i], "--dump-tokens")) {
+            dump_toks is 1;
+            i is i + 1;
+            continue;
+        }
+        if (streq(argv[i], "--compile")) {
+            dump_toks is 0;
+            i is i + 1;
+            continue;
+        }
+        if (streq(argv[i], "--backend=zn")) {
+            # Supported for compatibility with older test scripts; current compiler is Zinc-only.
+            i is i + 1;
+            continue;
+        }
+        if (streq(argv[i], "--emit-asm")) {
+            emit_asm is 1;
+            dump_toks is 0;
+            i is i + 1;
+            continue;
+        }
+        if (streq(argv[i], "--debug")) {
+            debug is 1;
+            g_debug is 1;
+            dbg("enabled via --debug");
+            i is i + 1;
+            continue;
+        }
+        if (streq(argv[i], "--debug-driver")) {
+            g_debug is 1;
+            dbg("enabled via --debug-driver");
+            i is i + 1;
+            continue;
+        }
+        if (streq(argv[i], "-S")) {
+            if (i + 1 >= argc) { txtout("missing path after -S"); out(1); }
+            out_asm is argv[i + 1];
+            dump_toks is 0;
+            i is i + 2;
+            continue;
+        }
+        if (streq(argv[i], "-o")) {
+            if (i + 1 >= argc) { txtout("missing path after -o"); out(1); }
+            out_bin is argv[i + 1];
+            dump_toks is 0;
+            i is i + 2;
+            continue;
+        }
+
+        if (len(input) == 0) {
+            input is argv[i];
+            i is i + 1;
+            continue;
+        }
+
+        txtout("unknown arg: ", argv[i]);
+        out(1);
+    }
+
+    if (len(input) == 0) {
+        txtout("missing input file");
+        out(1);
+    }
+
+    if (file_exists(input) == false) {
+        txtout("failed to read file");
+        out(1);
+    }
+
+    dbg_s("input=", input);
+
+    if (dump_toks == 1) {
+        src is zn_file_read_all(input);
+        toks is VecToken();
+        toks.init();
+        tok_count is lex(src, toks);
+        dbg_i("lex(input) tok_count=", tok_count);
+        for (int j is 0; j < tok_count; j is j + 1) {
+            dump_token(src,
+                      VecToken.get_kind(toks, j),
+                      VecToken.get_start(toks, j),
+                      VecToken.get_len(toks, j),
+                      VecToken.get_line(toks, j),
+                      VecToken.get_col(toks, j));
+        }
+        out(0);
+    }
+
+    string asm_path is out_asm;
+    if (len(asm_path) == 0) { asm_path is "build/znc_zn_out.s"; }
+
+    # Ensure the default output directory exists (codegen writes the asm file directly).
+    string mkdir_cmd is str_concat2("mkdir -p ", "build");
+    rt_system(mkdir_cmd);
+    free(mkdir_cmd);
+
+    # Resolve import(...) directives and compile all units as one translation unit.
+    dbg("building combined source");
+    combined is build_combined_source(input);
+    dbg_i("combined bytes=", len(combined));
+    toks2 is VecToken();
+    toks2.init();
+    tok_count2 is lex(combined, toks2);
+    dbg_i("lex(combined) tok_count=", tok_count2);
+
+    dbg_s("codegen asm_path=", asm_path);
+    codegen_basic(combined, toks2, tok_count2, debug, asm_path);
+    dbg("codegen done");
+    if (emit_asm == 1 || len(out_asm) > 0) {
+        txtout("Assembly written");
+        out(0);
+    }
+
+    # If `-o` points to a directory (common usage in this repo), emit the final
+    # executable as `<out_dir>/<input_stem>`.
+    link_out is out_bin;
+    string td is str_concat2("test -d ", out_bin);
+    is_out_dir is (rt_system(td) == 0);
+    free(td);
+    if (is_out_dir == 1) {
+        string stem is path_stem(input);
+        link_out is str_concat3(out_bin, "/", stem);
+        free(stem);
+    }
+
+    needs_wayland is contains_substr(combined, "__zn_wlwin_create");
+    string cmd is "";
+    if (needs_wayland == 1) {
+        string cmd1 is str_concat4("cc ", asm_path, " runtime/wayland_shim.c runtime/xdg-shell-protocol.c ", "$(pkg-config --cflags --libs wayland-client)");
+        cmd is str_concat3(cmd1, " -o ", link_out);
+        free(cmd1);
+    } else {
+        cmd is str_concat4("cc ", asm_path, " -o ", link_out);
+    }
+    dbg_s("link cmd=", cmd);
+    rc is rt_system(cmd);
+    free(cmd);
+    dbg_i("link rc=", rc);
+    if (is_out_dir == 1) { free(link_out); }
+    if (rc != 0) {
+        txtout("link failed");
+        out(1);
+    }
+
+    txtout("Built");
+    out(0);
+}

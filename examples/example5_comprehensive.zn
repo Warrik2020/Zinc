@@ -1,0 +1,78 @@
+###
+Comprehensive Example: Sum and Statistics Calculator
+
+This example combines all Zinc language features:
+- Multiple functions with different return types
+- Control flow (if, for, while)
+- Type inference and explicit types
+- Comments (single and multi-line)
+- Built-in output functions
+###
+
+func float calculateSum(int n) {
+    sum is 0;
+    for (int i is 1; i <= n; i is i + 1) {
+        sum is sum + i;
+    }
+    return sum;
+}
+
+func float calculateAverage(int n) {
+    sum is calculateSum(n);
+    return sum / n;
+}
+
+func void printStatistics(int limit) {
+    txtout("=== Statistics ===");
+    
+    # Single-line comment
+    txtout("Numbers from 1 to:");
+    txtout(limit);
+    
+    for (int i is 1; i <= limit; i is i + 1) {
+        square is i * i;
+        
+        # Check if number is even or odd
+        if (i % 2 == 0) {
+            txtout("Even:");
+        }
+        else {
+            txtout("Odd:");
+        }
+        
+        txtout(i);
+    }
+}
+
+func int fibonacci(int n) {
+    if (n <= 1) {
+        return n;
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2);
+}
+
+func int main() {
+    # Calculate statistics
+    limit is 5;
+    sum is calculateSum(limit);
+    avg is calculateAverage(limit);
+    
+    txtout("Sum of 1 to 5:");
+    txtout(sum);
+    
+    txtout("Average:");
+    txtout(avg);
+    
+    # Print detailed statistics
+    printStatistics(5);
+    
+    # Calculate Fibonacci numbers
+    txtout("Fibonacci sequence:");
+    for (int i is 0; i < 8; i is i + 1) {
+        fib is fibonacci(i);
+        txtout(fib);
+    }
+    
+    # Exit with success
+    out(0);
+}

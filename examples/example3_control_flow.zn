@@ -1,0 +1,55 @@
+###
+Example 3: Control Flow (if/else, loops)
+
+This example demonstrates:
+- If/else conditional statements
+- While loops
+- For loops
+- Break and continue statements
+###
+
+func int main() {
+    # If/else example
+    age is 20;
+    
+    if (age >= 18) {
+        txtout("You are an adult");
+    }
+    else {
+        txtout("You are a minor");
+    }
+    
+    # While loop example
+    txtout("Countdown with while:");
+    count is 5;
+    while (count > 0) {
+        txtout(count);
+        count is count - 1;
+    }
+    
+    # For loop example
+    txtout("Counting with for:");
+    for (int i is 0; i < 5; i is i + 1) {
+        txtout(i);
+    }
+    
+    # For loop with break
+    txtout("For loop with break:");
+    for (int j is 0; j < 10; j is j + 1) {
+        if (j == 3) {
+            break;
+        }
+        txtout(j);
+    }
+    
+    # For loop with continue
+    txtout("For loop with continue:");
+    for (int k is 0; k < 5; k is k + 1) {
+        if (k == 2) {
+            continue;
+        }
+        txtout(k);
+    }
+    
+    out(0);
+}

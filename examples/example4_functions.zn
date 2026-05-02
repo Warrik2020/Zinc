@@ -1,0 +1,56 @@
+###
+Example 4: Functions and Mathematical Operations
+
+This example demonstrates:
+- Function declarations with parameters
+- Multiple function definitions
+- Return statements and return values
+- Mathematical operations (arithmetic)
+- Type inference with function returns
+###
+
+func float calculateAverage(int a, int b, int c) {
+    sum is a + b + c;
+    average is sum / 3.0;
+    return average;
+}
+
+func bool isEven(int number) {
+    return number % 2 == 0;
+}
+
+func int factorial(int n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+func void printSquares(int limit) {
+    for (int i is 1; i <= limit; i is i + 1) {
+        square is i * i;
+        txtout(square);
+    }
+}
+
+func int main() {
+    # Test calculateAverage
+    avg is calculateAverage(10, 20, 30);
+    txtout(avg);  # Should output 20.0
+    
+    # Test isEven
+    number is 8;
+    if (isEven(number)) {
+        txtout("8 is even");
+    }
+    
+    # Test factorial
+    fact is factorial(5);
+    txtout(fact);  # Should output 120
+    
+    # Test printSquares
+    txtout("Squares of numbers 1-5:");
+    printSquares(5);
+    
+    out(0);
+}

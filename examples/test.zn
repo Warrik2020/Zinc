@@ -1,0 +1,7 @@
+func int main() {
+    var1 is 1 + 2 * 3;
+
+    txtout(var1);
+
+    out(0);
+}

@@ -1,0 +1,32 @@
+###
+Example 2: Variables, Types, and Type Inference
+
+This example demonstrates:
+- Variable declaration with explicit types
+- Variable declaration with type inference
+- Type coercion during assignment
+- Multiple variable types (int, float, string, bool)
+###
+
+func int main() {
+    # Explicit type declarations
+    int age is 25;
+    float salary is 50000.50;
+    string name is "Alice";
+    bool employed is true;
+    
+    # Type inference
+    count is 100;           # inferred as int
+    pi is 3.14159;         # inferred as float
+    greeting is "Hi there"; # inferred as string
+    active is false;       # inferred as bool
+    
+    # Output variables
+    txtout(age);
+    txtout(salary);
+    txtout(name);
+    txtout(count);
+    txtout(pi);
+    
+    out(0);
+}

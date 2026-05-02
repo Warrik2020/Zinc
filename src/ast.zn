@@ -1,0 +1,156 @@
+module();
+
+###
+ast.zn - placeholder for the Zinc compiler AST.
+###
+
+import("../Zinc-Standard-Lib/Memory.zn");
+import("../Zinc-Standard-Lib/String.zn");
+
+class VecParam {
+    int data;
+    int len;
+    int cap;
+
+    func void init(int* self) {
+        self->data is 0;
+        self->len is 0;
+        self->cap is 0;
+    }
+
+    func void destroy(int* self) {
+        if (self->data != 0) {
+            free(self->data);
+            self->data is 0;
+        }
+        self->len is 0;
+        self->cap is 0;
+    }
+
+    func void ensure_one(int* self) {
+        if (self->len >= self->cap) {
+            newcap is 0;
+            if (self->cap == 0) { newcap is 64; }
+            else { newcap is self->cap * 2; }
+
+            newdata is rt_malloc(newcap * 5 * 8);
+            if (self->data != 0) {
+                rt_memcpy(newdata, self->data, self->len * 5 * 8);
+                free(self->data);
+            }
+            self->data is newdata;
+            self->cap is newcap;
+        }
+    }
+
+    # Record stride = 5:
+    # 0 type_start, 1 type_len, 2 ptr_level, 3 name_start, 4 name_len
+    func int push_uninit(int* self) {
+        VecParam.ensure_one(self);
+        idx is self->len;
+        self->len is self->len + 1;
+        return idx;
+    }
+
+    func void set(int* self, int idx, int field, int value) {
+        ptr_store(self->data, idx * 5 + field, value);
+    }
+
+    func int get_type_start(int* self, int idx) { return ptr_load(self->data, idx * 5 + 0); }
+    func int get_type_len(int* self, int idx) { return ptr_load(self->data, idx * 5 + 1); }
+    func int get_ptr_level(int* self, int idx) { return ptr_load(self->data, idx * 5 + 2); }
+    func int get_name_start(int* self, int idx) { return ptr_load(self->data, idx * 5 + 3); }
+    func int get_name_len(int* self, int idx) { return ptr_load(self->data, idx * 5 + 4); }
+
+    func int count(int* self) { return self->len; }
+}
+
+class VecFunc {
+    int data;
+    int len;
+    int cap;
+
+    func void init(int* self) {
+        self->data is 0;
+        self->len is 0;
+        self->cap is 0;
+    }
+
+    func void destroy(int* self) {
+        if (self->data != 0) {
+            free(self->data);
+            self->data is 0;
+        }
+        self->len is 0;
+        self->cap is 0;
+    }
+
+    func void ensure_one(int* self) {
+        if (self->len >= self->cap) {
+            newcap is 0;
+            if (self->cap == 0) { newcap is 64; }
+            else { newcap is self->cap * 2; }
+
+            newdata is rt_malloc(newcap * 8 * 8);
+            if (self->data != 0) {
+                rt_memcpy(newdata, self->data, self->len * 8 * 8);
+                free(self->data);
+            }
+            self->data is newdata;
+            self->cap is newcap;
+        }
+    }
+
+    # Record stride = 8:
+    # 0 name_start, 1 name_len, 2 ret_start, 3 ret_len,
+    # 4 param_base, 5 param_count, 6 body_tok_start, 7 body_tok_end
+    func int push_uninit(int* self) {
+        VecFunc.ensure_one(self);
+        idx is self->len;
+        self->len is self->len + 1;
+        return idx;
+    }
+
+    func void set(int* self, int idx, int field, int value) {
+        ptr_store(self->data, idx * 8 + field, value);
+    }
+
+    func int get_name_start(int* self, int idx) { return ptr_load(self->data, idx * 8 + 0); }
+    func int get_name_len(int* self, int idx) { return ptr_load(self->data, idx * 8 + 1); }
+    func int get_ret_start(int* self, int idx) { return ptr_load(self->data, idx * 8 + 2); }
+    func int get_ret_len(int* self, int idx) { return ptr_load(self->data, idx * 8 + 3); }
+    func int get_param_base(int* self, int idx) { return ptr_load(self->data, idx * 8 + 4); }
+    func int get_param_count(int* self, int idx) { return ptr_load(self->data, idx * 8 + 5); }
+    func int get_body_tok_start(int* self, int idx) { return ptr_load(self->data, idx * 8 + 6); }
+    func int get_body_tok_end(int* self, int idx) { return ptr_load(self->data, idx * 8 + 7); }
+
+    func int count(int* self) { return self->len; }
+}
+
+class Program {
+    int funcs;
+    int params;
+
+    func void init(int* self) {
+        self->funcs is VecFunc();
+        VecFunc.init(self->funcs);
+        self->params is VecParam();
+        VecParam.init(self->params);
+    }
+
+    func void destroy(int* self) {
+        if (self->funcs != 0) {
+            VecFunc.destroy(self->funcs);
+            free(self->funcs);
+            self->funcs is 0;
+        }
+        if (self->params != 0) {
+            VecParam.destroy(self->params);
+            free(self->params);
+            self->params is 0;
+        }
+    }
+
+    func int func_count(int* self) { return VecFunc.count(self->funcs); }
+    func int param_count(int* self) { return VecParam.count(self->params); }
+}

@@ -1,0 +1,18 @@
+###
+Pointer demo
+###
+
+func int main() {
+    x is 41;
+    int* p is &x;
+    *p is *p + 1;
+    txtout(x);      # expects 42
+
+    int* n is nullptr;
+    if (n == nullptr) {
+        txtout("nullptr ok");
+    }
+
+    out(0);
+}
+

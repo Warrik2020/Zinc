@@ -1,0 +1,282 @@
+module();
+
+import("ast.zn");
+import("../Zinc-Standard-Lib/String.zn");
+import("../Zinc-Standard-Lib/VecToken.zn");
+import("lexer.zn");
+
+###
+parser.zn - Zinc compiler parser.
+###
+
+class Parser {
+    string src;
+    int toks;
+    int pos;
+    int funcs;
+    int params;
+
+    func void init(int* self, string src, int* tokens, int* funcs, int* params) {
+        self->src is src;
+        self->toks is tokens;
+        self->pos is 0;
+        self->funcs is funcs;
+        self->params is params;
+    }
+
+    func int cur_kind(int* self) { return VecToken.get_kind(self->toks, self->pos); }
+    func int cur_start(int* self) { return VecToken.get_start(self->toks, self->pos); }
+    func int cur_len(int* self) { return VecToken.get_len(self->toks, self->pos); }
+    func int at_eof(int* self) { return Parser.cur_kind(self) == TK_EOF; }
+
+    func string cur_text(int* self) {
+        return substr(self->src, Parser.cur_start(self), Parser.cur_len(self));
+    }
+
+    func int cur_text_eq(int* self, string lit) {
+        n is Parser.cur_len(self);
+        if (n != len(lit)) { return 0; }
+        t is substr(self->src, Parser.cur_start(self), n);
+        ok is 0;
+        if (__zinc_rt_strcmp(t, lit) == 0) { ok is 1; }
+        free(t);
+        return ok;
+    }
+
+    func void error_here(int* self, string msg) {
+        line is VecToken.get_line(self->toks, self->pos);
+        col is VecToken.get_col(self->toks, self->pos);
+        txtout("parse error at ", line, ":", col, ": ", msg);
+        out(1);
+    }
+
+    func void expect_ident(int* self) {
+        if (Parser.cur_kind(self) != TK_IDENT) {
+            Parser.error_here(self, "expected identifier");
+        }
+    }
+
+    func void expect_punct_text(int* self, string punct) {
+        if (Parser.cur_kind(self) != TK_PUNCT || Parser.cur_text_eq(self, punct) == 0) {
+            Parser.error_here(self, "expected punctuation");
+        }
+    }
+
+    func void advance(int* self) { self->pos is self->pos + 1; }
+
+    func void expect_keyword(int* self, string kw) {
+        if (Parser.cur_kind(self) != TK_IDENT || Parser.cur_text_eq(self, kw) == 0) {
+            Parser.error_here(self, "expected keyword");
+        }
+    }
+
+    func int consume_punct(int* self, string punct) {
+        if (Parser.cur_kind(self) == TK_PUNCT && Parser.cur_text_eq(self, punct) == 1) {
+            Parser.advance(self);
+            return 1;
+        }
+        return 0;
+    }
+
+    func int match_keyword(int* self, string kw) {
+        if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, kw) == 1) {
+            Parser.advance(self);
+            return 1;
+        }
+        return 0;
+    }
+
+    func void parse_type_and_name(int* self, int* out_type_start, int* out_type_len,
+                                  int* out_ptr_level, int* out_name_start, int* out_name_len) {
+        Parser.expect_ident(self);
+        type_start is Parser.cur_start(self);
+        type_len is Parser.cur_len(self);
+        Parser.advance(self);
+
+        ptr_level is 0;
+        while (Parser.consume_punct(self, "*") == 1) { ptr_level is ptr_level + 1; }
+
+        Parser.expect_ident(self);
+        name_start is Parser.cur_start(self);
+        name_len is Parser.cur_len(self);
+        Parser.advance(self);
+
+        *out_type_start is type_start;
+        *out_type_len is type_len;
+        *out_ptr_level is ptr_level;
+        *out_name_start is name_start;
+        *out_name_len is name_len;
+    }
+
+    func void parse_param_list(int* self, int* out_param_base, int* out_param_count) {
+        Parser.expect_punct_text(self, "(");
+        Parser.advance(self);
+
+        base is VecParam.count(self->params);
+        count is 0;
+
+        if (Parser.consume_punct(self, ")") == 1) {
+            *out_param_base is base;
+            *out_param_count is count;
+            return;
+        }
+
+        while (1) {
+            tstart is 0;
+            tlen is 0;
+            plevel is 0;
+            nstart is 0;
+            nlen is 0;
+            Parser.parse_type_and_name(self, &tstart, &tlen, &plevel, &nstart, &nlen);
+            idx is VecParam.push_uninit(self->params);
+            VecParam.set(self->params, idx, 0, tstart);
+            VecParam.set(self->params, idx, 1, tlen);
+            VecParam.set(self->params, idx, 2, plevel);
+            VecParam.set(self->params, idx, 3, nstart);
+            VecParam.set(self->params, idx, 4, nlen);
+            count is count + 1;
+
+            if (Parser.consume_punct(self, ")") == 1) { break; }
+            Parser.expect_punct_text(self, ",");
+            Parser.advance(self);
+        }
+
+        *out_param_base is base;
+        *out_param_count is count;
+    }
+
+    func void parse_block_range(int* self, int* out_body_start, int* out_body_end) {
+        Parser.expect_punct_text(self, "{");
+        body_start is self->pos;
+        Parser.advance(self);
+
+        depth is 1;
+        while (!Parser.at_eof(self) && depth > 0) {
+            if (Parser.cur_kind(self) == TK_PUNCT) {
+                if (Parser.cur_text_eq(self, "{") == 1) { depth is depth + 1; }
+                else if (Parser.cur_text_eq(self, "}") == 1) { depth is depth - 1; }
+            }
+            Parser.advance(self);
+        }
+
+        if (depth != 0) { Parser.error_here(self, "unterminated block"); }
+
+        body_end is self->pos - 1; # token index of the closing '}'
+        *out_body_start is body_start;
+        *out_body_end is body_end;
+    }
+
+    func void parse_func(int* self) {
+        Parser.expect_keyword(self, "func");
+        Parser.advance(self);
+
+        # Return type
+        Parser.expect_ident(self);
+        ret_start is Parser.cur_start(self);
+        ret_len is Parser.cur_len(self);
+        Parser.advance(self);
+
+        # Name
+        Parser.expect_ident(self);
+        name_start is Parser.cur_start(self);
+        name_len is Parser.cur_len(self);
+        Parser.advance(self);
+
+        param_base is 0;
+        param_count is 0;
+        Parser.parse_param_list(self, &param_base, &param_count);
+
+        body_start is 0;
+        body_end is 0;
+        Parser.parse_block_range(self, &body_start, &body_end);
+
+        fidx is VecFunc.push_uninit(self->funcs);
+        VecFunc.set(self->funcs, fidx, 0, name_start);
+        VecFunc.set(self->funcs, fidx, 1, name_len);
+        VecFunc.set(self->funcs, fidx, 2, ret_start);
+        VecFunc.set(self->funcs, fidx, 3, ret_len);
+        VecFunc.set(self->funcs, fidx, 4, param_base);
+        VecFunc.set(self->funcs, fidx, 5, param_count);
+        VecFunc.set(self->funcs, fidx, 6, body_start);
+        VecFunc.set(self->funcs, fidx, 7, body_end);
+    }
+
+    func void parse_class(int* self) {
+        Parser.expect_keyword(self, "class");
+        Parser.advance(self);
+
+        # Class name
+        Parser.expect_ident(self);
+        class_name_start is Parser.cur_start(self);
+        class_name_len is Parser.cur_len(self);
+        Parser.advance(self);
+
+        # Parse class body
+        Parser.expect_punct_text(self, "{");
+        Parser.advance(self);
+
+        depth is 1;
+        while (!Parser.at_eof(self) && depth > 0) {
+            if (Parser.cur_kind(self) == TK_PUNCT) {
+                if (Parser.cur_text_eq(self, "{") == 1) { depth is depth + 1; }
+                else if (Parser.cur_text_eq(self, "}") == 1) { depth is depth - 1; }
+            }
+            Parser.advance(self);
+        }
+
+        if (depth != 0) { Parser.error_here(self, "unterminated class body"); }
+    }
+
+    func void parse_program(int* self) {
+        while (!Parser.at_eof(self)) {
+            # Handle module declaration - check token text since keywords are TK_IDENT
+            if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, "module") == 1) {
+                Parser.advance(self);
+                if (Parser.consume_punct(self, "(") == 1) {
+                    Parser.consume_punct(self, ")");
+                }
+                continue;
+            }
+
+            # Handle import statement
+            if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, "import") == 1) {
+                Parser.advance(self);
+                if (Parser.consume_punct(self, "(") == 1) {
+                    # Skip string literal
+                    if (Parser.cur_kind(self) == TK_STRING) {
+                        Parser.advance(self);
+                    }
+                    Parser.consume_punct(self, ")");
+                }
+                continue;
+            }
+
+            # Handle class declaration
+            if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, "class") == 1) {
+                Parser.parse_class(self);
+                continue;
+            }
+
+            # Handle func declaration
+            if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, "func") == 1) {
+                Parser.parse_func(self);
+                continue;
+            }
+
+            # Skip semicolons
+            if (Parser.cur_kind(self) == TK_PUNCT && Parser.cur_text_eq(self, ";") == 1) {
+                Parser.advance(self);
+                continue;
+            }
+
+            Parser.error_here(self, "expected top-level declaration");
+        }
+    }
+}
+
+func void parse_program(string src, int* tokens, int* funcs, int* params) {
+    p is Parser();
+    Parser.init(p, src, tokens, funcs, params);
+    Parser.parse_program(p);
+    free(p);
+}

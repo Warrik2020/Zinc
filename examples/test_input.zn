@@ -1,0 +1,19 @@
+# Test txtin and txtout_nl features
+
+func int main() {
+    # Test txtout_nl (no newline)
+    txtout_nl("Enter your name: ");
+    
+    # Test txtin (read input)
+    string name is txtin();
+    
+    # Print the name with newline
+    txtout("Hello, ", name);
+    
+    # Test txtout_nl with integer
+    txtout_nl("Your name has ");
+    txtout_nl(10);
+    txtout(" characters (estimated)");
+    
+    return 0;
+}

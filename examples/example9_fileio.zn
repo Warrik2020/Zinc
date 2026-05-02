@@ -1,0 +1,19 @@
+import("../zinc-standard-lib/FileIO.zn");
+
+func int main() {
+    path is "zinc_fileio_demo.txt";
+
+    fd is file_open_write(path);
+    if (fd == -1) {
+        txtout("open failed");
+        out(1);
+    }
+    file_write_string(fd, "hello from zinc");
+    file_close(fd);
+
+    contents is file_read_all(path);
+    txtout(contents);
+    free(contents);
+
+    out(0);
+}

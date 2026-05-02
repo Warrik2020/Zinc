@@ -1,0 +1,308 @@
+module();
+
+import("../Zinc-Standard-Lib/String.zn");
+import("../Zinc-Standard-Lib/Ascii.zn");
+import("../Zinc-Standard-Lib/VecToken.zn");
+
+# Token types
+private int TK_EOF is 0;
+private int TK_IDENT is 1;
+private int TK_NUMBER is 2;
+private int TK_STRING is 3;
+private int TK_PUNCT is 4;
+
+# Keyword token types
+private int TK_FUNC is 5;
+private int TK_INT is 6;
+private int TK_FLOAT is 7;
+private int TK_STRING_TYPE is 8;
+private int TK_BOOL is 9;
+private int TK_CHAR is 10;
+private int TK_VOID is 11;
+private int TK_IF is 12;
+private int TK_ELSE is 13;
+private int TK_WHILE is 14;
+private int TK_FOR is 15;
+private int TK_BREAK is 16;
+private int TK_CONTINUE is 17;
+private int TK_RETURN is 18;
+private int TK_TRUE is 19;
+private int TK_FALSE is 20;
+private int TK_TXTOUT is 21;
+private int TK_TXTOUT_NL is 22;
+private int TK_TXTIN is 23;
+private int TK_OUT is 24;
+private int TK_IS is 25;
+private int TK_CONST is 26;
+private int TK_STRUCT is 27;
+private int TK_SWITCH is 28;
+private int TK_CASE is 29;
+private int TK_DEFAULT is 30;
+private int TK_MATCH is 31;
+private int TK_TRY is 32;
+private int TK_CATCH is 33;
+private int TK_THROW is 34;
+private int TK_IMPORT is 35;
+private int TK_EXPORT is 36;
+private int TK_MODULE is 37;
+private int TK_PRIVATE is 38;
+private int TK_TYPE is 39;
+private int TK_NEW is 40;
+private int TK_DELETE is 41;
+private int TK_SIZEOF is 42;
+private int TK_DO is 43;
+private int TK_NULLPTR is 44;
+private int TK_CLASS is 45;
+private int TK_ASM is 46;
+private int TK_CHAR_LITERAL is 47;
+
+func bool is_hex_digit(int c) {
+    if (c >= 48 && c <= 57) { return true; } # 0-9
+    if (c >= 65 && c <= 70) { return true; } # A-F
+    if (c >= 97 && c <= 102) { return true; } # a-f
+    return false;
+}
+
+func int keyword_lookup(string text) {
+    # Keywords map to token types
+    if (text == "func") { return TK_FUNC; }
+    if (text == "int") { return TK_INT; }
+    if (text == "float") { return TK_FLOAT; }
+    if (text == "string") { return TK_STRING_TYPE; }
+    if (text == "bool") { return TK_BOOL; }
+    if (text == "char") { return TK_CHAR; }
+    if (text == "void") { return TK_VOID; }
+    if (text == "if") { return TK_IF; }
+    if (text == "else") { return TK_ELSE; }
+    if (text == "while") { return TK_WHILE; }
+    if (text == "for") { return TK_FOR; }
+    if (text == "break") { return TK_BREAK; }
+    if (text == "continue") { return TK_CONTINUE; }
+    if (text == "return") { return TK_RETURN; }
+    if (text == "true") { return TK_TRUE; }
+    if (text == "false") { return TK_FALSE; }
+    if (text == "txtout") { return TK_TXTOUT; }
+    if (text == "txtout_nl") { return TK_TXTOUT_NL; }
+    if (text == "txtin") { return TK_TXTIN; }
+    if (text == "out") { return TK_OUT; }
+    if (text == "is") { return TK_IS; }
+    if (text == "const") { return TK_CONST; }
+    if (text == "struct") { return TK_STRUCT; }
+    if (text == "switch") { return TK_SWITCH; }
+    if (text == "case") { return TK_CASE; }
+    if (text == "default") { return TK_DEFAULT; }
+    if (text == "match") { return TK_MATCH; }
+    if (text == "try") { return TK_TRY; }
+    if (text == "catch") { return TK_CATCH; }
+    if (text == "throw") { return TK_THROW; }
+    if (text == "import") { return TK_IMPORT; }
+    if (text == "export") { return TK_EXPORT; }
+    if (text == "module") { return TK_MODULE; }
+    if (text == "private") { return TK_PRIVATE; }
+    if (text == "type") { return TK_TYPE; }
+    if (text == "new") { return TK_NEW; }
+    if (text == "delete") { return TK_DELETE; }
+    if (text == "sizeof") { return TK_SIZEOF; }
+    if (text == "do") { return TK_DO; }
+    if (text == "nullptr") { return TK_NULLPTR; }
+    if (text == "class") { return TK_CLASS; }
+    if (text == "asm") { return TK_ASM; }
+    return TK_IDENT;
+}
+
+func void dump_token(string src, int kind, int start, int n, int line, int col) {
+    if (kind == TK_EOF) {
+        txtout("EOF");
+        return;
+    }
+    # Best-effort token text (can allocate). Avoid huge dumps.
+    shown is n;
+    if (shown > 40) { shown is 40; }
+    text is substr(src, start, shown);
+    if (kind == TK_IDENT) {
+        txtout("IDENT(", line, ":", col, "): ", text);
+    } else if (kind == TK_NUMBER) {
+        txtout("NUMBER(", line, ":", col, "): ", text);
+    } else if (kind == TK_STRING) {
+        txtout("STRING(", line, ":", col, "): ", text);
+    } else if (kind == TK_CHAR_LITERAL) {
+        txtout("CHAR(", line, ":", col, "): ", text);
+    } else if (kind == TK_PUNCT) {
+        txtout("PUNCT(", line, ":", col, "): ", text);
+    } else {
+        # Keep the Zinc-port output simple: treat keywords as identifiers.
+        txtout("IDENT(", line, ":", col, "): ", text);
+    }
+    free(text);
+}
+
+func int lex(string src, int* tokens) {
+    VecToken.init(tokens);
+    count is 0;
+
+    n is len(src);
+    i is 0;
+    line is 1;
+    col is 1;
+
+    in_block_comment is 0;
+
+    while (i < n) {
+        c is src[i];
+
+        # Block comment toggles on lines starting with ###
+        if (c == 35) {
+            if (i + 2 < n && src[i + 1] == 35 && src[i + 2] == 35) {
+                in_block_comment is 1 - in_block_comment;
+                i is i + 3;
+                col is col + 3;
+                continue;
+            }
+        }
+        if (in_block_comment == 1) {
+            if (c == 10) { line is line + 1; col is 1; }
+            else { col is col + 1; }
+            i is i + 1;
+            continue;
+        }
+
+        # Line comment: # ... \n
+        if (c == 35) {
+            while (i < n && src[i] != 10) { i is i + 1; col is col + 1; }
+            continue;
+        }
+
+        if (is_space(c)) {
+            if (c == 10) { line is line + 1; col is 1; }
+            else { col is col + 1; }
+            i is i + 1;
+            continue;
+        }
+
+        # Identifier
+        if (is_alpha(c)) {
+            start is i;
+            start_line is line;
+            start_col is col;
+            i is i + 1;
+            col is col + 1;
+            while (i < n) {
+                c2 is src[i];
+                if (!(is_alpha(c2) || is_digit(c2))) { break; }
+                i is i + 1;
+                col is col + 1;
+            }
+            id_len is i - start;
+            VecToken.push(tokens, TK_IDENT, start, id_len, start_line, start_col);
+            count is count + 1;
+            continue;
+        }
+
+        # Number
+        if (is_digit(c)) {
+            start is i;
+            start_line is line;
+            start_col is col;
+            # Hex literal: 0x...
+            if (c == 48 && i + 2 < n && (src[i + 1] == 120 || src[i + 1] == 88) && is_hex_digit(src[i + 2])) {
+                i is i + 2;
+                col is col + 2;
+                while (i < n && is_hex_digit(src[i])) { i is i + 1; col is col + 1; }
+            } else {
+                i is i + 1;
+                col is col + 1;
+                while (i < n) {
+                    c2 is src[i];
+                    if (!is_digit(c2)) { break; }
+                    i is i + 1;
+                    col is col + 1;
+                }
+            }
+            VecToken.push(tokens, TK_NUMBER, start, i - start, start_line, start_col);
+            count is count + 1;
+            continue;
+        }
+
+        # String literal (supports basic backslash escapes for scanning)
+        if (c == 34) {
+            start is i;
+            start_line is line;
+            start_col is col;
+            i is i + 1;
+            col is col + 1;
+            while (i < n && src[i] != 34) {
+                if (src[i] == 92) {
+                    if (i + 1 < n) {
+                        i is i + 2;
+                        col is col + 2;
+                        continue;
+                    }
+                }
+                if (src[i] == 10) { line is line + 1; col is 1; }
+                else { col is col + 1; }
+                i is i + 1;
+            }
+            if (i < n && src[i] == 34) { i is i + 1; col is col + 1; }
+            VecToken.push(tokens, TK_STRING, start, i - start, start_line, start_col);
+            count is count + 1;
+            continue;
+        }
+
+        # Char literal
+        if (c == 39) {
+            start is i;
+            start_line is line;
+            start_col is col;
+            i is i + 1;
+            col is col + 1;
+            ch is src[i];
+            if (ch == 92 && i + 1 < n) {
+                # Handle escape sequences
+                i is i + 1;
+                col is col + 1;
+                esc is src[i];
+                if (esc == 110) { ch is 10; }  # \n
+                else if (esc == 116) { ch is 9; }   # \t
+                else if (esc == 92) { ch is 92; }   # \\
+                else if (esc == 39) { ch is 39; }  # \'
+                else if (esc == 48) { ch is 0; }   # \0
+            }
+            i is i + 1;
+            col is col + 1;
+            if (i < n && src[i] == 39) { i is i + 1; col is col + 1; }
+            VecToken.push(tokens, TK_CHAR_LITERAL, start, i - start, start_line, start_col);
+            count is count + 1;
+            continue;
+        }
+
+        # Punctuation: prefer multi-char operators
+        start is i;
+        start_line is line;
+        start_col is col;
+        punct_len is 1;
+        if (i + 1 < n) {
+            c2 is src[i + 1];
+
+            # 2-char operators
+            if ((c == 61 && c2 == 61) || (c == 33 && c2 == 61) ||
+                (c == 60 && c2 == 61) || (c == 62 && c2 == 61) ||
+                (c == 38 && c2 == 38) || (c == 124 && c2 == 124) ||
+                (c == 45 && c2 == 62) || (c == 60 && c2 == 60) ||
+                (c == 62 && c2 == 62) || (c == 43 && c2 == 43) ||
+                (c == 45 && c2 == 45) || (c == 43 && c2 == 61) ||
+                (c == 45 && c2 == 61) || (c == 42 && c2 == 61) ||
+                (c == 47 && c2 == 61) || (c == 37 && c2 == 61)) {
+                punct_len is 2;
+            }
+        }
+
+        i is i + punct_len;
+        col is col + punct_len;
+        VecToken.push(tokens, TK_PUNCT, start, punct_len, start_line, start_col);
+        count is count + 1;
+    }
+
+    VecToken.push(tokens, TK_EOF, n, 0, line, col);
+    count is count + 1;
+    return count;
+}

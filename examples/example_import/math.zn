@@ -1,0 +1,27 @@
+module();
+
+class Math {
+    int stored_value;
+
+    func int add(int a, int b) {
+        return a + b;
+    }
+
+    func int fib(int n) {
+        if (n <= 1) { return n; }
+        a is 0;
+        b is 1;
+        for (int i is 2; i <= n; i is i + 1) {
+            t is a + b;
+            a is b;
+            b is t;
+        }
+        return b;
+    }
+
+    # Test `self` parameter convention for method calls
+    func void foo(int* self, int x) {
+        self->stored_value is Math.add(x, x);
+        txtout("Stored value is ", self->stored_value);
+    }
+}

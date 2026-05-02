@@ -1,0 +1,28 @@
+import("../zinc-standard-lib/Wayland.zn");
+
+func int main() {
+    win is wlwin_create(640, 360, "Zinc Wayland");
+    if (win == 0) {
+        txtout("failed to create wayland window (no compositor / missing xdg-shell?)");
+        out(1);
+    }
+
+    # Solid blue-ish (XRGB8888: 0x00RRGGBB)
+    wlwin_present_rgba(win, 0x002244CC);
+
+    # Pump events a bit so the compositor can map the window.
+    for (int i is 0; i < 2000000; i is i + 1) {
+        wlwin_pump(win);
+    }
+
+    running is true;
+    while (running) {
+        input is txtin();
+        if (input == "quit") {
+            running is false;
+        }
+    }
+
+    wlwin_destroy(win);
+    out(0);
+}

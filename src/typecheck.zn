@@ -1,0 +1,103 @@
+module();
+
+import("ast.zn");
+import("../Zinc-Standard-Lib/String.zn");
+import("lexer.zn");
+
+###
+typecheck.zn - Zinc compiler typechecker.
+###
+
+# Type constants (matching C enum)
+private int TYPE_INT is 0;
+private int TYPE_FLOAT is 1;
+private int TYPE_STRING is 2;
+private int TYPE_BOOL is 3;
+private int TYPE_CHAR is 4;
+private int TYPE_VOID is 5;
+private int TYPE_POINTER is 6;
+private int TYPE_NULLPTR is 7;
+private int TYPE_UNKNOWN is 8;
+
+func string type_name(int ty) {
+    if (ty == TYPE_INT) { return "int"; }
+    if (ty == TYPE_FLOAT) { return "float"; }
+    if (ty == TYPE_STRING) { return "string"; }
+    if (ty == TYPE_BOOL) { return "bool"; }
+    if (ty == TYPE_CHAR) { return "char"; }
+    if (ty == TYPE_VOID) { return "void"; }
+    if (ty == TYPE_POINTER) { return "pointer"; }
+    if (ty == TYPE_NULLPTR) { return "nullptr"; }
+    return "unknown";
+}
+
+func void tc_error(string msg) {
+    txtout("typecheck error: ", msg);
+    out(1);
+}
+
+func string func_name(string src, int* funcs, int idx) {
+    start is VecFunc.get_name_start(funcs, idx);
+    n is VecFunc.get_name_len(funcs, idx);
+    return substr(src, start, n);
+}
+
+func int parse_type_from_text(string src, int type_start, int type_len) {
+    if (type_len == 3) {
+        t is substr(src, type_start, 3);
+        if (t == "int") { free(t); return TYPE_INT; }
+        if (t == "bool") { free(t); return TYPE_BOOL; }
+        if (t == "void") { free(t); return TYPE_VOID; }
+        free(t);
+    }
+    if (type_len == 4) {
+        t is substr(src, type_start, 4);
+        if (t == "char") { free(t); return TYPE_CHAR; }
+        if (t == "true") { free(t); return TYPE_BOOL; }
+        if (t == "null") { free(t); return TYPE_NULLPTR; }
+        free(t);
+    }
+    if (type_len == 5) {
+        t is substr(src, type_start, 5);
+        if (t == "float") { free(t); return TYPE_FLOAT; }
+        if (t == "false") { free(t); return TYPE_BOOL; }
+        free(t);
+    }
+    if (type_len == 6) {
+        t is substr(src, type_start, 6);
+        if (t == "string") { free(t); return TYPE_STRING; }
+        free(t);
+    }
+    return TYPE_UNKNOWN;
+}
+
+func int infer_expr_type(string src, int* toks, int pos) {
+    kind is VecToken.get_kind(toks, pos);
+    if (kind == TK_NUMBER) { return TYPE_INT; }
+    if (kind == TK_STRING) { return TYPE_STRING; }
+    if (kind == TK_TRUE || kind == TK_FALSE) { return TYPE_BOOL; }
+    if (kind == TK_IDENT) { return TYPE_UNKNOWN; }
+    return TYPE_UNKNOWN;
+}
+
+func void typecheck_funcs(string src, int* funcs) {
+    n is VecFunc.count(funcs);
+    has_main is 0;
+
+    for (int i is 0; i < n; i is i + 1) {
+        ni is func_name(src, funcs, i);
+        if (ni == "main") { has_main is 1; }
+
+        for (int j is 0; j < i; j is j + 1) {
+            nj is func_name(src, funcs, j);
+            if (ni == nj) {
+                txtout("duplicate function: ", ni);
+                out(1);
+            }
+        }
+    }
+
+    if (has_main == 0) {
+        tc_error("missing func main");
+    }
+}

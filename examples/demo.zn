@@ -1,0 +1,99 @@
+import("example_import/math.zn");
+
+###
+Working Zinc Demo Example
+
+This demonstrates:
+- Importing modules
+- Variable declaration and assignment
+- Basic arithmetic
+- String output
+- Control flow (if/else, loops)
+- Class namespacing (Class.func())
+- Program exit
+###
+
+class Counter {
+    int val;
+
+    func void inc(int* self) {
+        self->val is self->val + 1;
+    }
+}
+
+func int main(int argc, char *argv[]) {
+    if (argc > 1) {
+        if (argv[1] == "ping") {
+            txtout("pong");
+        } else {
+            txtout("Unknown argument: ", argv[1]);
+        }
+    }
+    txtout("Welcome to Zinc!");
+    
+    # Variables and arithmetic
+    x is 10;
+    y is 20;
+    sum is 0;
+    
+    # Simple loop
+    counter is 0;
+    while (counter < 3) {
+        sum is sum + x;
+        counter is counter + 1;
+    }
+    
+    # Conditionals
+    if (sum > 0) {
+        txtout("Sum is positive");
+    }
+    txtout("Sum = ", sum);
+    sum is "test"; # testing dynamic variables
+    
+    txtout(sum);
+    txtout("Math.add(2, 3) = ", Math.add(2, 3));
+
+    c is Counter();
+    v is Counter(); # testing multiple instances
+    c->val is 0;
+    c.inc();
+    txtout("Counter.val = ", c->val);
+    txtout("Counter.val from v instance (should be 0) = ", v.val);
+    free(c);
+    free(v);
+
+    num is (100/2) * 3; # testing operator precedence
+    txtout(num);
+
+    a is txtin();
+
+    for (int i is 0; i < 5; i is i + 1) {
+        if (a == "test") {
+            txtout("correct");
+        } else {
+            out(0);
+        }
+    }
+
+    a is 1;
+    b is 2;
+    c is Math.add(a, b); # lives inside `example_import/math.zn`
+    txtout(c);
+
+    a is Math.fib(50);
+    txtout("Fibonacci of 50 is ", a);
+
+    math is Math();
+    math2 is Math();
+
+    txtout(math.add(40, 2));
+    txtout(math.fib(10));
+    math.foo(21);
+    txtout("Stored value in math instance is ", math.stored_value);
+    txtout("Stored value in math2 instance (should be 0) is ", math2.stored_value);
+    free(math);
+    free(math2);
+
+    txtout("Done!");
+    out(0);
+}

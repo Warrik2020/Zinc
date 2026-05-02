@@ -1,0 +1,28 @@
+###
+Recursion demo:
+- Direct recursion (factorial)
+- Mutual recursion (is_even/is_odd)
+###
+
+func int fact(int n) {
+    if (n <= 1) { return 1; }
+    return n * fact(n - 1);
+}
+
+func bool is_even(int n) {
+    if (n == 0) { return true; }
+    return is_odd(n - 1);
+}
+
+func bool is_odd(int n) {
+    if (n == 0) { return false; }
+    return is_even(n - 1);
+}
+
+func int main() {
+    txtout("fact(5) = ", fact(5));     # 120
+    txtout("is_even(10) = ", is_even(10)); # 1
+    txtout("is_odd(9) = ", is_odd(9));     # 1
+    out(0);
+}
+
