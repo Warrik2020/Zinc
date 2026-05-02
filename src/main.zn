@@ -4,12 +4,28 @@ import("../Zinc-Standard-Lib/VecInt.zn");
 import("../Zinc-Standard-Lib/String.zn");
 import("lexer.zn");
 import("codegen.zn");
+import("16bit/codegen16.zn");
 
 func int streq(string a, string b) { return __zinc_rt_strcmp(a, b) == 0; }
 func string rt_strdup(string s) { return __zinc_rt_strdup(s); }
 
 func int str_as_int(string s) { return s; }
 func string int_as_str(int p) { return p; }
+
+func int parse_dec_int(string s) {
+    n is len(s);
+    i is 0;
+    sign is 1;
+    if (n > 0 && s[0] == 45) { sign is -1; i is 1; }
+    v is 0;
+    while (i < n) {
+        c is s[i];
+        if (c < 48 || c > 57) { break; }
+        v is v * 10 + (c - 48);
+        i is i + 1;
+    }
+    return v * sign;
+}
 
 # Used to enable tracing in helper functions (avoid threading `debug` everywhere).
 g_debug is 0;
@@ -424,7 +440,7 @@ func string build_combined_source(string entry_path) {
 
 func int main(int argc, char *argv[]) {
     if (argc < 2) {
-        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens]");
+        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--compile-for=ELF|x86-64] [--bitness=16|32|64]");
         out(1);
     }
 
@@ -435,6 +451,12 @@ func int main(int argc, char *argv[]) {
     dump_toks is 1;
     debug is 0;
     emit_asm is 0;
+    compile_for is "ELF"; # default to native platform; supported values: ELF, raw x86-64
+    bitness is 64; # default to native platform; supported values: 16, 32, 64
+
+    # Target selection (resolved after CLI parsing).
+    # kind: 0 = ELF executable, 1 = raw x86-64 flat binary (via objcopy)
+    target_kind is 0;
 
     i is 1;
     while (i < argc) {
@@ -486,7 +508,24 @@ func int main(int argc, char *argv[]) {
             i is i + 2;
             continue;
         }
-
+        if (streq(argv[i], "--compile-for")) {
+            if (i + 1 >= argc) { txtout("missing target after --compile-for"); out(1); }
+            compile_for is argv[i + 1];
+            dump_toks is 0;
+            i is i + 2;
+            continue;
+        }
+        if (streq(argv[i], "--bitness")) {
+            if (i + 1 >= argc) { txtout("missing value after --bitness"); out(1); }
+            bitness is parse_dec_int(argv[i + 1]);
+            if (bitness != 16 && bitness != 32 && bitness != 64) {
+                txtout("invalid bitness: ", argv[i + 1]);
+                out(1);
+            }
+            dump_toks is 0;
+            i is i + 2;
+            continue;
+        }
         if (len(input) == 0) {
             input is argv[i];
             i is i + 1;
@@ -494,6 +533,27 @@ func int main(int argc, char *argv[]) {
         }
 
         txtout("unknown arg: ", argv[i]);
+        out(1);
+    }
+
+    if (streq(compile_for, "ELF")) {
+        target_kind is 0;
+    } else if (streq(compile_for, "x86-64")) {
+        target_kind is 1;
+    } else {
+        txtout("unsupported --compile-for: ", compile_for);
+        out(1);
+    }
+
+    if (bitness == 16) {
+        # 16-bit linking is not supported; allow assembly emission only.
+        if (emit_asm == 0 && len(out_asm) == 0) {
+            txtout("--bitness=16 currently supports assembly output only (use -S or --emit-asm)");
+            out(1);
+        }
+    }
+    if (target_kind == 1 && bitness != 64) {
+        txtout("--compile-for=x86-64 requires --bitness=64");
         out(1);
     }
 
@@ -544,7 +604,8 @@ func int main(int argc, char *argv[]) {
     dbg_i("lex(combined) tok_count=", tok_count2);
 
     dbg_s("codegen asm_path=", asm_path);
-    codegen_basic(combined, toks2, tok_count2, debug, asm_path);
+    if (bitness == 16) { codegen16_basic(combined, toks2, tok_count2, asm_path); }
+    else { codegen_basic(combined, toks2, tok_count2, debug, bitness, asm_path); }
     dbg("codegen done");
     if (emit_asm == 1 || len(out_asm) > 0) {
         txtout("Assembly written");
@@ -563,16 +624,47 @@ func int main(int argc, char *argv[]) {
         free(stem);
     }
 
-    string cmd is "";
-    cmd is str_concat4("cc ", asm_path, " -o ", link_out);
-    dbg_s("link cmd=", cmd);
-    rc is rt_system(cmd);
-    free(cmd);
-    dbg_i("link rc=", rc);
-    if (is_out_dir == 1) { free(link_out); }
-    if (rc != 0) {
-        txtout("link failed");
-        out(1);
+    if (target_kind == 0) {
+        string cmd is "";
+        if (bitness == 32) { cmd is str_concat4("cc -m32 -no-pie ", asm_path, " -o ", link_out); }
+        else { cmd is str_concat4("cc ", asm_path, " -o ", link_out); }
+        dbg_s("link cmd=", cmd);
+        rc is rt_system(cmd);
+        free(cmd);
+        dbg_i("link rc=", rc);
+        if (is_out_dir == 1) { free(link_out); }
+        if (rc != 0) {
+            txtout("link failed");
+            out(1);
+        }
+    } else {
+        # Raw x86-64: link an ELF, then extract a flat binary.
+        string tmp_elf is str_concat2(link_out, ".elf");
+
+        string link_cmd is "";
+        link_cmd is str_concat4("cc ", asm_path, " -o ", tmp_elf);
+        dbg_s("link cmd=", link_cmd);
+        rc is rt_system(link_cmd);
+        free(link_cmd);
+        dbg_i("link rc=", rc);
+        if (rc != 0) {
+            txtout("link failed");
+            free(tmp_elf);
+            if (is_out_dir == 1) { free(link_out); }
+            out(1);
+        }
+
+        string objcopy_cmd is str_concat4("objcopy -O binary ", tmp_elf, " ", link_out);
+        dbg_s("objcopy cmd=", objcopy_cmd);
+        rc2 is rt_system(objcopy_cmd);
+        free(objcopy_cmd);
+        dbg_i("objcopy rc=", rc2);
+        free(tmp_elf);
+        if (is_out_dir == 1) { free(link_out); }
+        if (rc2 != 0) {
+            txtout("objcopy failed");
+            out(1);
+        }
     }
 
     txtout("Built");

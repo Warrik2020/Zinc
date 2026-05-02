@@ -1,0 +1,1997 @@
+module();
+
+###
+codegen16.zn - 16-bit Zinc codegen backend.
+#
+# Goal: implement as much as possible from the normal backend for --bitness=16,
+# producing freestanding 16-bit real-mode assembly (GAS `.code16gcc`).
+#
+# Practical constraints:
+# - No hosted libc linking is assumed.
+# - Runtime helpers are emitted into the output assembly (printing, exit, malloc,
+#   memcpy/memset, strcmp/strlen/strdup).
+#
+# ABI:
+# - Near calls, cdecl-like: args pushed right-to-left, caller cleans.
+# - `int` is 16-bit signed, returned in %ax.
+# - Pointers are 16-bit offsets in the current data segment (DS is set to CS at start).
+###
+
+private int TK_EOF is 0;
+private int TK_IDENT is 1;
+private int TK_NUMBER is 2;
+private int TK_STRING is 3;
+private int TK_PUNCT is 4;
+
+private int TY_INT is 1;
+private int TY_STRING is 2;
+private int TY_VOID is 3;
+private int TY_STR_ARR is 4; # char* argv[] (not meaningful in 16-bit, kept for parser compatibility)
+
+private int TY_CLASS_BASE is 1000;
+private int TY_CLASSREF_BASE is 2000;
+
+func int is_class_ptr_ty16(int ty) { return ty >= TY_CLASS_BASE && ty < TY_CLASSREF_BASE; }
+func int is_class_ref_ty16(int ty) { return ty >= TY_CLASSREF_BASE; }
+func int class_idx_from_ty16(int ty) {
+    if (is_class_ptr_ty16(ty) == 1) { return ty - TY_CLASS_BASE; }
+    if (is_class_ref_ty16(ty) == 1) { return ty - TY_CLASSREF_BASE; }
+    return -1;
+}
+
+func void cg16_error(string msg) {
+    txtout("codegen16 error: ", msg);
+    out(1);
+}
+
+class Codegen16 {
+    string src;
+    int* toks;
+    int tok_count;
+    int emit;
+    int fd;
+    int scratch;
+    int label_counter;
+    int cur_ret_label;
+
+    int vars;     # VecInt (stride 5)
+    int strtab;   # VecInt (pairs: start,len)
+    int fns;      # VecInt (stride 12, same layout as codegen.zn)
+    int globals;  # VecInt (stride 4)
+    int classes;  # VecInt (stride 3)
+    int fields;   # VecInt (stride 4)
+    int methods;  # VecInt (stride 4)
+
+    int break_stack; # VecInt labels
+    int cont_stack;  # VecInt labels
+    int cur_fn_class_idx;
+    int cur_self_off;
+    int cur_fn_is_instance;
+
+    func void init(int* self, string src, int* toks, int tok_count) {
+        self->src is src;
+        self->toks is toks;
+        self->tok_count is tok_count;
+        self->emit is 0;
+        self->fd is 0;
+        self->scratch is rt_malloc(8);
+        rt_memset(self->scratch, 0, 8);
+        self->label_counter is 0;
+        self->cur_ret_label is -1;
+
+        self->vars is VecInt(); VecInt.init(self->vars);
+        self->strtab is VecInt(); VecInt.init(self->strtab);
+        self->break_stack is VecInt(); VecInt.init(self->break_stack);
+        self->cont_stack is VecInt(); VecInt.init(self->cont_stack);
+
+        self->fns is 0;
+        self->globals is 0;
+        self->classes is 0;
+        self->fields is 0;
+        self->methods is 0;
+
+        self->cur_fn_class_idx is -1;
+        self->cur_self_off is 0;
+        self->cur_fn_is_instance is 0;
+    }
+
+    func void emit_byte(int* self, int c) {
+        rt_memset(self->scratch, c, 1);
+        file_write(self->fd, self->scratch, 1);
+    }
+    func void emit_str(int* self, string s) { file_write_string(self->fd, s); }
+    func void emit_nl(int* self) { Codegen16.emit_byte(self, 10); }
+    func void emit_line(int* self, string s) { Codegen16.emit_str(self, s); Codegen16.emit_nl(self); }
+
+    func void emit_dec(int* self, int v) {
+        if (v == 0) { Codegen16.emit_byte(self, 48); return; }
+        digits is rt_malloc(32);
+        n is 0;
+        tmp is v;
+        if (tmp < 0) { tmp is -tmp; Codegen16.emit_byte(self, 45); }
+        while (tmp > 0) {
+            d is tmp % 10;
+            rt_memset(digits + n, 48 + d, 1);
+            tmp is tmp / 10;
+            n is n + 1;
+        }
+        for (int i is n - 1; i >= 0; i is i - 1) { file_write(self->fd, digits + i, 1); }
+        free(digits);
+    }
+
+    func void emit_line_num(int* self, string a, int num, string b) {
+        Codegen16.emit_str(self, a);
+        Codegen16.emit_dec(self, num);
+        Codegen16.emit_str(self, b);
+        Codegen16.emit_nl(self);
+    }
+
+    func void error_at(int* self, string msg, int pos) {
+        line is 0;
+        col is 0;
+        if (pos >= 0 && pos < self->tok_count) {
+            line is VecToken.get_line(self->toks, pos);
+            col is VecToken.get_col(self->toks, pos);
+        }
+        txtout("codegen16 error at ", line, ":", col, ": ", msg);
+        out(1);
+    }
+
+    func int byte_at(int* self, int byte_off) {
+        src_ptr is self->src;
+        rt_memset(self->scratch, 0, 8);
+        rt_memcpy(self->scratch, src_ptr + byte_off, 1);
+        return self->scratch[0];
+    }
+
+    func int tok_punct1(int* self, int pos, int ch) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_PUNCT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 1) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen16.byte_at(self, s) == ch;
+    }
+    func int tok_punct2(int* self, int pos, int a, int b) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_PUNCT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 2) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen16.byte_at(self, s + 0) == a && Codegen16.byte_at(self, s + 1) == b;
+    }
+
+    func int slice_eq(int* self, int a_start, int a_len, int b_start, int b_len) {
+        if (a_len != b_len) { return 0; }
+        for (int i is 0; i < a_len; i is i + 1) {
+            if (Codegen16.byte_at(self, a_start + i) != Codegen16.byte_at(self, b_start + i)) { return 0; }
+        }
+        return 1;
+    }
+
+    # ===== keyword/token helpers =====
+    func int tok_is_lit(int* self, int pos, string lit) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        n is VecToken.get_len(self->toks, pos);
+        ln is len(lit);
+        if (n != ln) { return 0; }
+        for (int i is 0; i < ln; i is i + 1) {
+            if (Codegen16.byte_at(self, s + i) != lit[i]) { return 0; }
+        }
+        return 1;
+    }
+    func int tok_is_is(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "is"); }
+    func int tok_is_func(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "func"); }
+    func int tok_is_return(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "return"); }
+    func int tok_is_if(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "if"); }
+    func int tok_is_else(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "else"); }
+    func int tok_is_while(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "while"); }
+    func int tok_is_for(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "for"); }
+    func int tok_is_break(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "break"); }
+    func int tok_is_continue(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "continue"); }
+    func int tok_is_int_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "int"); }
+    func int tok_is_string_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "string"); }
+    func int tok_is_void_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "void"); }
+    func int tok_is_class_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "class"); }
+    func int tok_is_true(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "true"); }
+    func int tok_is_false(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "false"); }
+    func int tok_is_nullptr(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "nullptr"); }
+    func int tok_is_txtout(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "txtout"); }
+    func int tok_is_txtout_nl(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "txtout_nl"); }
+    func int tok_is_out(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "out"); }
+    func int tok_is_main(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "main"); }
+
+    # ===== string table =====
+    func int strtab_count(int* self) { return VecInt.count(self->strtab) / 2; }
+    func int strtab_get_start(int* self, int idx) { return VecInt.get(self->strtab, idx * 2 + 0); }
+    func int strtab_get_len(int* self, int idx) { return VecInt.get(self->strtab, idx * 2 + 1); }
+
+    func int strtab_intern(int* self, int start, int n) {
+        count is Codegen16.strtab_count(self);
+        for (int i is 0; i < count; i is i + 1) {
+            if (Codegen16.slice_eq(self, start, n, Codegen16.strtab_get_start(self, i), Codegen16.strtab_get_len(self, i)) == 1) { return i; }
+        }
+        VecInt.push(self->strtab, start);
+        VecInt.push(self->strtab, n);
+        return count;
+    }
+
+    func void emit_label_num(int* self, string prefix, int idx) {
+        Codegen16.emit_str(self, prefix);
+        Codegen16.emit_dec(self, idx);
+    }
+
+    func void emit_asm_string_escaped(int* self, int idx, int start, int n) {
+        Codegen16.emit_label_num(self, "str_", idx);
+        Codegen16.emit_str(self, ": .asciz ");
+        Codegen16.emit_byte(self, 34);
+        for (int i is 0; i < n; i is i + 1) {
+            c is Codegen16.byte_at(self, start + i);
+            if (c == 34 || c == 92) { Codegen16.emit_byte(self, 92); Codegen16.emit_byte(self, c); }
+            else if (c == 10) { Codegen16.emit_byte(self, 92); Codegen16.emit_byte(self, 110); }
+            else if (c == 9) { Codegen16.emit_byte(self, 92); Codegen16.emit_byte(self, 116); }
+            else { Codegen16.emit_byte(self, c); }
+        }
+        Codegen16.emit_byte(self, 34);
+        Codegen16.emit_nl(self);
+    }
+
+    # ===== vars table (locals+params moved to stack slots) =====
+    # stride 5: name_start, name_len, ty, off, mutable
+    func int vars_count(int* self) { return VecInt.count(self->vars) / 5; }
+    func int vars_get_name_start(int* self, int idx) { return VecInt.get(self->vars, idx * 5 + 0); }
+    func int vars_get_name_len(int* self, int idx) { return VecInt.get(self->vars, idx * 5 + 1); }
+    func int vars_get_type(int* self, int idx) { return VecInt.get(self->vars, idx * 5 + 2); }
+    func int vars_get_off(int* self, int idx) { return VecInt.get(self->vars, idx * 5 + 3); }
+    func int vars_get_mutable(int* self, int idx) { return VecInt.get(self->vars, idx * 5 + 4); }
+
+    func int vars_find(int* self, int name_start, int name_len) {
+        n is Codegen16.vars_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (name_len != Codegen16.vars_get_name_len(self, i)) { continue; }
+            s is Codegen16.vars_get_name_start(self, i);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, s + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+    func void vars_add(int* self, int name_start, int name_len, int ty, int off, int mutable) {
+        VecInt.push(self->vars, name_start);
+        VecInt.push(self->vars, name_len);
+        VecInt.push(self->vars, ty);
+        VecInt.push(self->vars, off);
+        VecInt.push(self->vars, mutable);
+    }
+
+    # ===== globals/classes/fields helpers (subset of codegen.zn) =====
+    # Global constants table stride=4: name_start,name_len,ty,val/stridx
+    func int globals_count(int* self) {
+        if (self->globals == 0) { return 0; }
+        return VecInt.count(self->globals) / 4;
+    }
+    func int globals_get_name_start(int* self, int idx) { return VecInt.get(self->globals, idx * 4 + 0); }
+    func int globals_get_name_len(int* self, int idx) { return VecInt.get(self->globals, idx * 4 + 1); }
+    func int globals_get_type(int* self, int idx) { return VecInt.get(self->globals, idx * 4 + 2); }
+    func int globals_get_val(int* self, int idx) { return VecInt.get(self->globals, idx * 4 + 3); }
+
+    func int globals_find(int* self, int name_start, int name_len) {
+        n is Codegen16.globals_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (name_len != Codegen16.globals_get_name_len(self, i)) { continue; }
+            s is Codegen16.globals_get_name_start(self, i);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, s + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+
+    # Class table stride=3: name_start,name_len,size_bytes
+    func int classes_count(int* self) {
+        if (self->classes == 0) { return 0; }
+        return VecInt.count(self->classes) / 3;
+    }
+    func int classes_get_name_start(int* self, int idx) { return VecInt.get(self->classes, idx * 3 + 0); }
+    func int classes_get_name_len(int* self, int idx) { return VecInt.get(self->classes, idx * 3 + 1); }
+    func int classes_get_size(int* self, int idx) { return VecInt.get(self->classes, idx * 3 + 2); }
+
+    func int class_find_by_name(int* self, int name_start, int name_len) {
+        n is Codegen16.classes_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (name_len != Codegen16.classes_get_name_len(self, i)) { continue; }
+            s is Codegen16.classes_get_name_start(self, i);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, s + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+
+    # Fields table stride=4: class_idx,name_start,name_len,offset_bytes
+    func int fields_count(int* self) {
+        if (self->fields == 0) { return 0; }
+        return VecInt.count(self->fields) / 4;
+    }
+    func int field_offset(int* self, int class_idx, int name_start, int name_len) {
+        n is Codegen16.fields_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (VecInt.get(self->fields, i * 4 + 0) != class_idx) { continue; }
+            nl is VecInt.get(self->fields, i * 4 + 2);
+            if (nl != name_len) { continue; }
+            ns is VecInt.get(self->fields, i * 4 + 1);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, ns + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return VecInt.get(self->fields, i * 4 + 3); }
+        }
+        return -1;
+    }
+
+    # Method lookup in `self->fns` (kind=1).
+    func int method_find_func(int* self, int class_idx, int name_start, int name_len) {
+        if (self->fns == 0) { return -1; }
+        n is VecInt.count(self->fns) / 12;
+        for (int i is 0; i < n; i is i + 1) {
+            if (VecInt.get(self->fns, i * 12 + 0) != 1) { continue; }
+            if (VecInt.get(self->fns, i * 12 + 1) != class_idx) { continue; }
+            nl is VecInt.get(self->fns, i * 12 + 5);
+            if (nl != name_len) { continue; }
+            ns is VecInt.get(self->fns, i * 12 + 4);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, ns + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+
+    # Plain function return type lookup (kind=0)
+    func int fn_ret_ty_plain(int* self, int name_start, int name_len) {
+        if (self->fns == 0) { return TY_INT; }
+        n is VecInt.count(self->fns) / 12;
+        for (int i is 0; i < n; i is i + 1) {
+            kind is VecInt.get(self->fns, i * 12 + 0);
+            if (kind != 0) { continue; }
+            ns is VecInt.get(self->fns, i * 12 + 4);
+            nl is VecInt.get(self->fns, i * 12 + 5);
+            if (nl != name_len) { continue; }
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, ns + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return VecInt.get(self->fns, i * 12 + 6); }
+        }
+        return TY_INT;
+    }
+
+    func void emit_fn_symbol(int* self, int fn_idx) {
+        kind is VecInt.get(self->fns, fn_idx * 12 + 0);
+        if (kind == 0) {
+            ns is VecInt.get(self->fns, fn_idx * 12 + 4);
+            nl is VecInt.get(self->fns, fn_idx * 12 + 5);
+            file_write(self->fd, self->src + ns, nl);
+            return;
+        }
+        cs is VecInt.get(self->fns, fn_idx * 12 + 2);
+        cl is VecInt.get(self->fns, fn_idx * 12 + 3);
+        ms is VecInt.get(self->fns, fn_idx * 12 + 4);
+        ml is VecInt.get(self->fns, fn_idx * 12 + 5);
+        file_write(self->fd, self->src + cs, cl);
+        Codegen16.emit_str(self, "__");
+        file_write(self->fd, self->src + ms, ml);
+    }
+
+    # ===== label helpers =====
+    func int new_label(int* self) {
+        id is self->label_counter;
+        self->label_counter is self->label_counter + 1;
+        return id;
+    }
+    func void emit_label(int* self, int id) {
+        Codegen16.emit_str(self, ".L");
+        Codegen16.emit_dec(self, id);
+        Codegen16.emit_line(self, ":");
+    }
+
+    # ===== parsing: expression (int/string subset) =====
+    # Returns TY_*, leaves value in %ax when emitting (string/pointer also in %ax).
+
+    func int parse_expr(int* self, int* pos) { return Codegen16.parse_or(self, pos); }
+
+    func int parse_or(int* self, int* pos) {
+        ty is Codegen16.parse_and(self, pos);
+        while (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct2(self, *pos, 124, 124) == 1) {
+            *pos is *pos + 1;
+            if (ty != TY_INT) { cg16_error("|| expects int"); }
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+            rty is Codegen16.parse_and(self, pos);
+            if (rty != TY_INT) { cg16_error("|| expects int"); }
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    popw %bx");
+                Codegen16.emit_line(self, "    testw %bx, %bx");
+                Codegen16.emit_line(self, "    setne %bl");
+                Codegen16.emit_line(self, "    testw %ax, %ax");
+                Codegen16.emit_line(self, "    setne %al");
+                Codegen16.emit_line(self, "    orb %bl, %al");
+                Codegen16.emit_line(self, "    movzbw %al, %ax");
+            }
+            ty is TY_INT;
+        }
+        return ty;
+    }
+
+    func int parse_and(int* self, int* pos) {
+        ty is Codegen16.parse_eq(self, pos);
+        while (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct2(self, *pos, 38, 38) == 1) {
+            *pos is *pos + 1;
+            if (ty != TY_INT) { cg16_error("&& expects int"); }
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+            rty is Codegen16.parse_eq(self, pos);
+            if (rty != TY_INT) { cg16_error("&& expects int"); }
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    popw %bx");
+                Codegen16.emit_line(self, "    testw %bx, %bx");
+                Codegen16.emit_line(self, "    setne %bl");
+                Codegen16.emit_line(self, "    testw %ax, %ax");
+                Codegen16.emit_line(self, "    setne %al");
+                Codegen16.emit_line(self, "    andb %bl, %al");
+                Codegen16.emit_line(self, "    movzbw %al, %ax");
+            }
+            ty is TY_INT;
+        }
+        return ty;
+    }
+
+    func int parse_eq(int* self, int* pos) {
+        ty is Codegen16.parse_rel(self, pos);
+        while (VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+               (Codegen16.tok_punct2(self, *pos, 61, 61) == 1 || Codegen16.tok_punct2(self, *pos, 33, 61) == 1)) {
+            is_ne is Codegen16.tok_punct2(self, *pos, 33, 61);
+            *pos is *pos + 1;
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+            rty is Codegen16.parse_rel(self, pos);
+            if (ty == TY_STRING || rty == TY_STRING) {
+                if (ty != TY_STRING || rty != TY_STRING) { cg16_error("==/!= type mismatch"); }
+                if (self->emit == 1) {
+                    Codegen16.emit_line(self, "    movw %ax, %dx");
+                    Codegen16.emit_line(self, "    popw %ax");
+                    # call __zinc_rt_strcmp(lhs=ax, rhs=dx) -> ax=cmp
+                    Codegen16.emit_line(self, "    pushw %dx");
+                    Codegen16.emit_line(self, "    pushw %ax");
+                    Codegen16.emit_line(self, "    call __zinc_rt_strcmp");
+                    Codegen16.emit_line(self, "    addw $4, %sp");
+                    Codegen16.emit_line(self, "    testw %ax, %ax");
+                    if (is_ne == 1) { Codegen16.emit_line(self, "    setne %al"); }
+                    else { Codegen16.emit_line(self, "    sete %al"); }
+                    Codegen16.emit_line(self, "    movzbw %al, %ax");
+                }
+            } else {
+                if (self->emit == 1) {
+                    Codegen16.emit_line(self, "    popw %bx");
+                    Codegen16.emit_line(self, "    cmpw %ax, %bx");
+                    if (is_ne == 1) { Codegen16.emit_line(self, "    setne %al"); }
+                    else { Codegen16.emit_line(self, "    sete %al"); }
+                    Codegen16.emit_line(self, "    movzbw %al, %ax");
+                }
+            }
+            ty is TY_INT;
+        }
+        return ty;
+    }
+
+    func int parse_rel(int* self, int* pos) {
+        ty is Codegen16.parse_add(self, pos);
+        while (VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+               (Codegen16.tok_punct1(self, *pos, 60) == 1 || Codegen16.tok_punct1(self, *pos, 62) == 1 ||
+                Codegen16.tok_punct2(self, *pos, 60, 61) == 1 || Codegen16.tok_punct2(self, *pos, 62, 61) == 1)) {
+            is_lt is Codegen16.tok_punct1(self, *pos, 60);
+            is_gt is Codegen16.tok_punct1(self, *pos, 62);
+            is_le is Codegen16.tok_punct2(self, *pos, 60, 61);
+            is_ge is Codegen16.tok_punct2(self, *pos, 62, 61);
+            *pos is *pos + 1;
+            if (ty != TY_INT) { cg16_error("comparison expects int"); }
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+            rty is Codegen16.parse_add(self, pos);
+            if (rty != TY_INT) { cg16_error("comparison expects int"); }
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    popw %bx");
+                Codegen16.emit_line(self, "    cmpw %ax, %bx");
+                if (is_lt == 1) { Codegen16.emit_line(self, "    setl %al"); }
+                else if (is_gt == 1) { Codegen16.emit_line(self, "    setg %al"); }
+                else if (is_le == 1) { Codegen16.emit_line(self, "    setle %al"); }
+                else { Codegen16.emit_line(self, "    setge %al"); }
+                Codegen16.emit_line(self, "    movzbw %al, %ax");
+            }
+            ty is TY_INT;
+        }
+        return ty;
+    }
+
+    func int parse_add(int* self, int* pos) {
+        ty is Codegen16.parse_mul(self, pos);
+        while (VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+               (Codegen16.tok_punct1(self, *pos, 43) == 1 || Codegen16.tok_punct1(self, *pos, 45) == 1)) {
+            is_minus is Codegen16.tok_punct1(self, *pos, 45);
+            *pos is *pos + 1;
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+            rty is Codegen16.parse_mul(self, pos);
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    popw %bx");
+                if (is_minus == 1) {
+                    Codegen16.emit_line(self, "    xchg %ax, %bx");
+                    Codegen16.emit_line(self, "    subw %bx, %ax");
+                } else {
+                    Codegen16.emit_line(self, "    addw %bx, %ax");
+                }
+            }
+            if (is_minus == 1) { ty is TY_INT; }
+            else {
+                if ((ty == TY_STRING && rty == TY_INT) || (ty == TY_INT && rty == TY_STRING)) { ty is TY_STRING; }
+                else if (ty == TY_INT && rty == TY_INT) { ty is TY_INT; }
+                else { cg16_error("add expects int"); }
+            }
+        }
+        return ty;
+    }
+
+    func int parse_mul(int* self, int* pos) {
+        ty is Codegen16.parse_unary(self, pos);
+        while (VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+               (Codegen16.tok_punct1(self, *pos, 42) == 1 || Codegen16.tok_punct1(self, *pos, 47) == 1 || Codegen16.tok_punct1(self, *pos, 37) == 1)) {
+            op_div is Codegen16.tok_punct1(self, *pos, 47);
+            op_mod is Codegen16.tok_punct1(self, *pos, 37);
+            *pos is *pos + 1;
+            if (ty != TY_INT) { cg16_error("mul expects int"); }
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+            rty is Codegen16.parse_unary(self, pos);
+            if (rty != TY_INT) { cg16_error("mul expects int"); }
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    movw %ax, %cx");
+                Codegen16.emit_line(self, "    popw %ax");
+                if (op_div == 1 || op_mod == 1) {
+                    Codegen16.emit_line(self, "    cwd");
+                    Codegen16.emit_line(self, "    idivw %cx");
+                    if (op_mod == 1) { Codegen16.emit_line(self, "    movw %dx, %ax"); }
+                } else {
+                    Codegen16.emit_line(self, "    imulw %cx, %ax");
+                }
+            }
+            ty is TY_INT;
+        }
+        return ty;
+    }
+
+    func int parse_unary(int* self, int* pos) {
+        if (Codegen16.tok_punct1(self, *pos, 33) == 1) {
+            *pos is *pos + 1;
+            ty is Codegen16.parse_unary(self, pos);
+            if (ty != TY_INT) { cg16_error("unary ! expects int"); }
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    testw %ax, %ax");
+                Codegen16.emit_line(self, "    sete %al");
+                Codegen16.emit_line(self, "    movzbw %al, %ax");
+            }
+            return TY_INT;
+        }
+        if (Codegen16.tok_punct1(self, *pos, 38) == 1) {
+            *pos is *pos + 1;
+            if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg16_error("expected identifier after '&'"); }
+            ns is VecToken.get_start(self->toks, *pos);
+            nl is VecToken.get_len(self->toks, *pos);
+            vidx is Codegen16.vars_find(self, ns, nl);
+            if (vidx < 0) { cg16_error("unknown variable"); }
+            if (self->emit == 1) {
+                off is Codegen16.vars_get_off(self, vidx);
+                Codegen16.emit_str(self, "    leaw -");
+                Codegen16.emit_dec(self, off);
+                Codegen16.emit_line(self, "(%bp), %ax");
+            }
+            *pos is *pos + 1;
+            return TY_INT;
+        }
+        if (Codegen16.tok_punct1(self, *pos, 42) == 1) {
+            *pos is *pos + 1;
+            ty is Codegen16.parse_unary(self, pos);
+            if (ty != TY_INT) { cg16_error("deref expects int"); }
+            if (self->emit == 1) { Codegen16.emit_line(self, "    movw (%ax), %ax"); }
+            return TY_INT;
+        }
+        if (Codegen16.tok_punct1(self, *pos, 45) == 1) {
+            *pos is *pos + 1;
+            ty is Codegen16.parse_unary(self, pos);
+            if (ty != TY_INT) { cg16_error("unary - expects int"); }
+            if (self->emit == 1) { Codegen16.emit_line(self, "    negw %ax"); }
+            return TY_INT;
+        }
+        return Codegen16.parse_primary(self, pos);
+    }
+
+    func int parse_primary(int* self, int* pos) {
+        k is VecToken.get_kind(self->toks, *pos);
+        if (k == TK_NUMBER) {
+            start is VecToken.get_start(self->toks, *pos);
+            ln is VecToken.get_len(self->toks, *pos);
+            v is 0;
+            if (ln >= 3 && Codegen16.byte_at(self, start + 0) == 48 &&
+                (Codegen16.byte_at(self, start + 1) == 120 || Codegen16.byte_at(self, start + 1) == 88)) {
+                for (int i is 2; i < ln; i is i + 1) {
+                    c is Codegen16.byte_at(self, start + i);
+                    if (c >= 48 && c <= 57) { v is v * 16 + (c - 48); }
+                    else if (c >= 65 && c <= 70) { v is v * 16 + (c - 65 + 10); }
+                    else if (c >= 97 && c <= 102) { v is v * 16 + (c - 97 + 10); }
+                }
+            } else {
+                for (int i is 0; i < ln; i is i + 1) { v is v * 10 + (Codegen16.byte_at(self, start + i) - 48); }
+            }
+            if (self->emit == 1) { Codegen16.emit_line_num(self, "    movw $", v, ", %ax"); }
+            *pos is *pos + 1;
+            if (*pos + 1 < self->tok_count &&
+                VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+                Codegen16.tok_punct1(self, *pos, 46) == 1 &&
+                VecToken.get_kind(self->toks, *pos + 1) == TK_NUMBER) { *pos is *pos + 2; }
+            return TY_INT;
+        }
+        if (k == TK_STRING) {
+            start is VecToken.get_start(self->toks, *pos);
+            ln is VecToken.get_len(self->toks, *pos);
+            sstart is start + 1;
+            slen is ln - 2;
+            idx is Codegen16.strtab_intern(self, sstart, slen);
+            if (self->emit == 1) {
+                Codegen16.emit_str(self, "    movw $");
+                Codegen16.emit_label_num(self, "str_", idx);
+                Codegen16.emit_line(self, ", %ax");
+            }
+            *pos is *pos + 1;
+            return TY_STRING;
+        }
+        if (k == TK_IDENT) {
+            if (Codegen16.tok_is_true(self, *pos) == 1) { if (self->emit == 1) { Codegen16.emit_line(self, "    movw $1, %ax"); } *pos is *pos + 1; return TY_INT; }
+            if (Codegen16.tok_is_false(self, *pos) == 1) { if (self->emit == 1) { Codegen16.emit_line(self, "    xorw %ax, %ax"); } *pos is *pos + 1; return TY_INT; }
+            if (Codegen16.tok_is_nullptr(self, *pos) == 1) { if (self->emit == 1) { Codegen16.emit_line(self, "    xorw %ax, %ax"); } *pos is *pos + 1; return TY_INT; }
+
+            base_name_start is VecToken.get_start(self->toks, *pos);
+            base_name_len is VecToken.get_len(self->toks, *pos);
+            class_idx is Codegen16.class_find_by_name(self, base_name_start, base_name_len);
+            base_ty is 0;
+
+            # Class constructor: ClassName()
+            if (class_idx >= 0 && *pos + 1 < self->tok_count &&
+                VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+                Codegen16.tok_punct1(self, *pos + 1, 40) == 1) {
+                *pos is *pos + 2; # ident + '('
+                if (Codegen16.tok_punct1(self, *pos, 41) == 0) { cg16_error("class constructor args not supported"); }
+                *pos is *pos + 1;
+                if (self->emit == 1) {
+                    Codegen16.emit_str(self, "    call __zn_new_");
+                    file_write(self->fd, self->src + base_name_start, base_name_len);
+                    Codegen16.emit_nl(self);
+                }
+                base_ty is TY_CLASS_BASE + class_idx;
+            }
+            # Plain function call: ident(...)
+            else if (*pos + 1 < self->tok_count &&
+                     VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+                     Codegen16.tok_punct1(self, *pos + 1, 40) == 1) {
+                is_txtin is Codegen16.tok_is_lit(self, *pos, "txtin");
+                is_free is Codegen16.tok_is_lit(self, *pos, "free");
+                name_start is base_name_start;
+                name_len is base_name_len;
+                method_fn_i is -1;
+                is_implicit_method is 0;
+                if (self->cur_self_off != 0 && self->cur_fn_class_idx >= 0) {
+                    method_fn_i is Codegen16.method_find_func(self, self->cur_fn_class_idx, name_start, name_len);
+                    if (method_fn_i >= 0 && VecInt.get(self->fns, method_fn_i * 12 + 11) == 1) { is_implicit_method is 1; }
+                }
+
+                *pos is *pos + 2; # ident + '('
+                argc is 0;
+                first_arg_ty is 0;
+                if (is_implicit_method == 1 && self->emit == 1) {
+                    Codegen16.emit_str(self, "    movw -");
+                    Codegen16.emit_dec(self, self->cur_self_off);
+                    Codegen16.emit_line(self, "(%bp), %ax");
+                    Codegen16.emit_line(self, "    pushw %ax");
+                    argc is 1;
+                } else if (is_implicit_method == 1) {
+                    argc is 1;
+                }
+
+                if (Codegen16.tok_punct1(self, *pos, 41) == 0) {
+                    while (1) {
+                        aty is Codegen16.parse_expr(self, pos);
+                        if (argc == 0) { first_arg_ty is aty; }
+                        if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+                        argc is argc + 1;
+                        if (Codegen16.tok_punct1(self, *pos, 44) == 1) { *pos is *pos + 1; continue; }
+                        break;
+                    }
+                }
+                if (Codegen16.tok_punct1(self, *pos, 41) == 0) { cg16_error("expected ')'"); }
+                *pos is *pos + 1;
+
+                if (self->emit == 1) {
+                    if (is_txtin == 1) {
+                        Codegen16.emit_line(self, "    call txtin");
+                    } else if (is_free == 1) {
+                        Codegen16.emit_line(self, "    call __zinc_rt_free");
+                    } else {
+                        Codegen16.emit_str(self, "    call ");
+                        if (is_implicit_method == 1) { Codegen16.emit_fn_symbol(self, method_fn_i); }
+                        else { file_write(self->fd, self->src + name_start, name_len); }
+                        Codegen16.emit_nl(self);
+                    }
+                    if (argc > 0) {
+                        Codegen16.emit_str(self, "    addw $");
+                        Codegen16.emit_dec(self, argc * 2);
+                        Codegen16.emit_line(self, ", %sp");
+                    }
+                }
+
+                if (is_implicit_method == 1) { base_ty is VecInt.get(self->fns, method_fn_i * 12 + 6); }
+                else if (is_txtin == 1) { base_ty is TY_STRING; }
+                else { base_ty is Codegen16.fn_ret_ty_plain(self, name_start, name_len); }
+            }
+            # Variable or class reference
+            else {
+                if (class_idx >= 0) {
+                    *pos is *pos + 1;
+                    base_ty is TY_CLASSREF_BASE + class_idx;
+                } else {
+                    ns is base_name_start;
+                    nl is base_name_len;
+                    vidx is Codegen16.vars_find(self, ns, nl);
+                    if (vidx < 0) {
+                        gidx is Codegen16.globals_find(self, ns, nl);
+                        if (gidx < 0) { cg16_error("unknown variable"); }
+                        gty is Codegen16.globals_get_type(self, gidx);
+                        gval is Codegen16.globals_get_val(self, gidx);
+                        if (self->emit == 1) {
+                            if (gty == TY_STRING) {
+                                Codegen16.emit_str(self, "    movw $");
+                                Codegen16.emit_label_num(self, "str_", gval);
+                                Codegen16.emit_line(self, ", %ax");
+                            } else {
+                                Codegen16.emit_line_num(self, "    movw $", gval, ", %ax");
+                            }
+                        }
+                        *pos is *pos + 1;
+                        base_ty is gty;
+                    } else {
+                        base_ty is Codegen16.vars_get_type(self, vidx);
+                        if (self->emit == 1) {
+                            off is Codegen16.vars_get_off(self, vidx);
+                            Codegen16.emit_str(self, "    movw -");
+                            Codegen16.emit_dec(self, off);
+                            Codegen16.emit_line(self, "(%bp), %ax");
+                        }
+                        *pos is *pos + 1;
+                    }
+                }
+            }
+
+            # Postfix: member access / calls / array access
+            while (1) {
+                if (*pos >= self->tok_count) { break; }
+                # member access '.' or '->'
+                if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+                    (Codegen16.tok_punct1(self, *pos, 46) == 1 || Codegen16.tok_punct2(self, *pos, 45, 62) == 1)) {
+                    *pos is *pos + 1;
+                    if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg16_error("expected member name"); }
+                    mpos is *pos;
+                    mstart is VecToken.get_start(self->toks, *pos);
+                    mlen is VecToken.get_len(self->toks, *pos);
+                    *pos is *pos + 1;
+
+                    cls is class_idx_from_ty16(base_ty);
+                    if (cls < 0) { cg16_error("member access on non-object"); }
+
+                    # method call
+                    if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct1(self, *pos, 40) == 1) {
+                        fn_i is Codegen16.method_find_func(self, cls, mstart, mlen);
+                        if (fn_i < 0) { cg16_error("unknown method"); }
+                        is_instance is VecInt.get(self->fns, fn_i * 12 + 11);
+                        *pos is *pos + 1; # '('
+                        argc is 0;
+                        if (is_instance == 1 && is_class_ref_ty16(base_ty) == 0) {
+                            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+                            argc is argc + 1;
+                        }
+                        if (Codegen16.tok_punct1(self, *pos, 41) == 0) {
+                            while (1) {
+                                Codegen16.parse_expr(self, pos);
+                                if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+                                argc is argc + 1;
+                                if (Codegen16.tok_punct1(self, *pos, 44) == 1) { *pos is *pos + 1; continue; }
+                                break;
+                            }
+                        }
+                        if (Codegen16.tok_punct1(self, *pos, 41) == 0) { Codegen16.error_at(self, "expected ')'", *pos); }
+                        *pos is *pos + 1;
+                        if (is_instance == 1 && is_class_ref_ty16(base_ty) == 1 && argc == 0) { Codegen16.error_at(self, "instance method requires explicit self arg", mpos); }
+                        if (self->emit == 1) {
+                            Codegen16.emit_str(self, "    call ");
+                            Codegen16.emit_fn_symbol(self, fn_i);
+                            Codegen16.emit_nl(self);
+                            if (argc > 0) {
+                                Codegen16.emit_str(self, "    addw $");
+                                Codegen16.emit_dec(self, argc * 2);
+                                Codegen16.emit_line(self, ", %sp");
+                            }
+                        }
+                        base_ty is VecInt.get(self->fns, fn_i * 12 + 6);
+                        continue;
+                    }
+
+                    # field access
+                    if (is_class_ref_ty16(base_ty) == 1) { cg16_error("field access on class"); }
+                    off is Codegen16.field_offset(self, cls, mstart, mlen);
+                    if (off < 0) { Codegen16.error_at(self, "unknown field", mpos); }
+                    if (self->emit == 1) {
+                        Codegen16.emit_str(self, "    movw ");
+                        Codegen16.emit_dec(self, off);
+                        Codegen16.emit_line(self, "(%ax), %ax");
+                    }
+                    base_ty is TY_INT;
+                    continue;
+                }
+
+                # array access: expr '[' idx ']'
+                if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct1(self, *pos, 91) == 1) {
+                    *pos is *pos + 1;
+                    if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+                    ity is Codegen16.parse_expr(self, pos);
+                    if (ity != TY_INT) { cg16_error("index expects int"); }
+                    if (Codegen16.tok_punct1(self, *pos, 93) == 0) { Codegen16.error_at(self, "expected ']'", *pos); }
+                    *pos is *pos + 1;
+                    if (self->emit == 1) {
+                        Codegen16.emit_line(self, "    movw %ax, %cx");
+                        Codegen16.emit_line(self, "    popw %ax");
+                        if (base_ty == TY_STRING) {
+                            Codegen16.emit_line(self, "    addw %cx, %ax");
+                            Codegen16.emit_line(self, "    movzbw (%ax), %ax");
+                        } else {
+                            # char* argv[] : load word ptr
+                            Codegen16.emit_line(self, "    shlw $1, %cx");
+                            Codegen16.emit_line(self, "    addw %cx, %ax");
+                            Codegen16.emit_line(self, "    movw (%ax), %ax");
+                        }
+                    }
+                    if (base_ty == TY_STR_ARR) { base_ty is TY_STRING; }
+                    else { base_ty is TY_INT; }
+                    continue;
+                }
+
+                break;
+            }
+
+            return base_ty;
+        }
+        if (k == TK_PUNCT && Codegen16.tok_punct1(self, *pos, 40) == 1) {
+            *pos is *pos + 1;
+            ty is Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 41) == 0) { cg16_error("expected ')'"); }
+            *pos is *pos + 1;
+            return ty;
+        }
+        cg16_error("unexpected token in expression");
+        return TY_INT;
+    }
+
+    # ===== statements =====
+    func void parse_block(int* self, int* pos, int* out_lbrace, int* out_rbrace) {
+        if (Codegen16.tok_punct1(self, *pos, 123) == 0) { cg16_error("expected '{'"); }
+        *pos is *pos + 1;
+        *out_lbrace is *pos; # body start
+        depth is 1;
+        while (*pos < self->tok_count && VecToken.get_kind(self->toks, *pos) != TK_EOF && depth > 0) {
+            if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT) {
+                if (Codegen16.tok_punct1(self, *pos, 123) == 1) { depth is depth + 1; }
+                else if (Codegen16.tok_punct1(self, *pos, 125) == 1) { depth is depth - 1; }
+            }
+            *pos is *pos + 1;
+        }
+        if (depth != 0) { cg16_error("unterminated block"); }
+        *out_rbrace is *pos - 1; # token index of '}'
+    }
+
+    func void parse_bind_assign(int* self, int* pos, int end_ch, int require_semicolon) {
+        ty_decl is 0;
+        if (Codegen16.tok_is_int_kw(self, *pos) == 1) { ty_decl is TY_INT; *pos is *pos + 1; }
+        else if (Codegen16.tok_is_string_kw(self, *pos) == 1) { ty_decl is TY_STRING; *pos is *pos + 1; }
+
+        # pointer stars after explicit type
+        while (ty_decl != 0 &&
+               VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+               Codegen16.tok_punct1(self, *pos, 42) == 1) {
+            *pos is *pos + 1;
+        }
+
+        if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg16_error("expected identifier"); }
+        ns is VecToken.get_start(self->toks, *pos);
+        nl is VecToken.get_len(self->toks, *pos);
+        *pos is *pos + 1;
+        if (Codegen16.tok_is_is(self, *pos) == 0) { cg16_error("expected 'is'"); }
+        *pos is *pos + 1;
+        expr_ty is Codegen16.parse_expr(self, pos);
+        if (require_semicolon == 1) {
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+        } else {
+            if (VecToken.get_kind(self->toks, *pos) != TK_PUNCT || Codegen16.tok_punct1(self, *pos, end_ch) == 0) { cg16_error("expected end"); }
+        }
+
+        final_ty is expr_ty;
+        if (ty_decl != 0) { final_ty is ty_decl; }
+        if (ty_decl != 0 && expr_ty != ty_decl) { cg16_error("type mismatch"); }
+
+        vidx is Codegen16.vars_find(self, ns, nl);
+        if (vidx < 0) {
+            off is (Codegen16.vars_count(self) + 1) * 2;
+            mutable is 0;
+            if (ty_decl == 0) { mutable is 1; }
+            Codegen16.vars_add(self, ns, nl, final_ty, off, mutable);
+            vidx is Codegen16.vars_find(self, ns, nl);
+        } else {
+            if (Codegen16.vars_get_type(self, vidx) != final_ty) {
+                if (Codegen16.vars_get_mutable(self, vidx) == 1) { VecInt.set(self->vars, vidx * 5 + 2, final_ty); }
+                else { cg16_error("rebind type mismatch"); }
+            }
+        }
+
+        if (self->emit == 1) {
+            off2 is Codegen16.vars_get_off(self, vidx);
+            Codegen16.emit_str(self, "    movw %ax, -");
+            Codegen16.emit_dec(self, off2);
+            Codegen16.emit_line(self, "(%bp)");
+        }
+    }
+
+    func void parse_stmt(int* self, int* pos, int end) {
+        if (*pos >= end) { return; }
+        if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct1(self, *pos, 59) == 1) { *pos is *pos + 1; return; }
+
+        # pointer store: *ident is expr;
+        if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct1(self, *pos, 42) == 1) {
+            *pos is *pos + 1;
+            if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg16_error("expected identifier after '*'"); }
+            ns is VecToken.get_start(self->toks, *pos);
+            nl is VecToken.get_len(self->toks, *pos);
+            vidx is Codegen16.vars_find(self, ns, nl);
+            if (vidx < 0) { cg16_error("unknown variable"); }
+            if (self->emit == 1) {
+                off is Codegen16.vars_get_off(self, vidx);
+                Codegen16.emit_str(self, "    movw -");
+                Codegen16.emit_dec(self, off);
+                Codegen16.emit_line(self, "(%bp), %ax");
+                Codegen16.emit_line(self, "    pushw %ax");
+            }
+            *pos is *pos + 1;
+            if (Codegen16.tok_is_is(self, *pos) == 0) { cg16_error("expected 'is'"); }
+            *pos is *pos + 1;
+            Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    popw %bx");
+                Codegen16.emit_line(self, "    movw %ax, (%bx)");
+            }
+            return;
+        }
+
+        if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg16_error("expected statement"); }
+
+        if (Codegen16.tok_is_if(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 40) == 0) { cg16_error("expected '('"); }
+            *pos is *pos + 1;
+            Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 41) == 0) { cg16_error("expected ')'"); }
+            *pos is *pos + 1;
+
+            else_lbl is Codegen16.new_label(self);
+            end_lbl is Codegen16.new_label(self);
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    testw %ax, %ax");
+                Codegen16.emit_str(self, "    jz .L"); Codegen16.emit_dec(self, else_lbl); Codegen16.emit_nl(self);
+            }
+            bstart is 0; br is 0;
+            Codegen16.parse_block(self, pos, &bstart, &br);
+            Codegen16.parse_stmt_list(self, bstart, br);
+            if (self->emit == 1) {
+                Codegen16.emit_str(self, "    jmp .L"); Codegen16.emit_dec(self, end_lbl); Codegen16.emit_nl(self);
+                Codegen16.emit_label(self, else_lbl);
+            }
+            if (*pos < end && Codegen16.tok_is_else(self, *pos) == 1) {
+                *pos is *pos + 1;
+                if (*pos < end && Codegen16.tok_is_if(self, *pos) == 1) { Codegen16.parse_stmt(self, pos, end); }
+                else {
+                    b2 is 0; r2 is 0;
+                    Codegen16.parse_block(self, pos, &b2, &r2);
+                    Codegen16.parse_stmt_list(self, b2, r2);
+                }
+            }
+            if (self->emit == 1) { Codegen16.emit_label(self, end_lbl); }
+            return;
+        }
+
+        if (Codegen16.tok_is_while(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 40) == 0) { cg16_error("expected '('"); }
+            *pos is *pos + 1;
+            start_lbl is Codegen16.new_label(self);
+            end_lbl is Codegen16.new_label(self);
+            VecInt.push(self->break_stack, end_lbl);
+            VecInt.push(self->cont_stack, start_lbl);
+            if (self->emit == 1) { Codegen16.emit_label(self, start_lbl); }
+            Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 41) == 0) { cg16_error("expected ')'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    testw %ax, %ax");
+                Codegen16.emit_str(self, "    jz .L"); Codegen16.emit_dec(self, end_lbl); Codegen16.emit_nl(self);
+            }
+            bstart is 0; br is 0;
+            Codegen16.parse_block(self, pos, &bstart, &br);
+            Codegen16.parse_stmt_list(self, bstart, br);
+            if (self->emit == 1) {
+                Codegen16.emit_str(self, "    jmp .L"); Codegen16.emit_dec(self, start_lbl); Codegen16.emit_nl(self);
+                Codegen16.emit_label(self, end_lbl);
+            }
+            VecInt.pop(self->break_stack);
+            VecInt.pop(self->cont_stack);
+            return;
+        }
+
+        if (Codegen16.tok_is_for(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 40) == 0) { Codegen16.error_at(self, "expected '('", *pos); }
+            *pos is *pos + 1;
+
+            # init
+            if (Codegen16.tok_punct1(self, *pos, 59) == 1) { *pos is *pos + 1; }
+            else { Codegen16.parse_bind_assign(self, pos, 59, 1); }
+
+            cond_lbl is Codegen16.new_label(self);
+            post_lbl is Codegen16.new_label(self);
+            end_lbl is Codegen16.new_label(self);
+
+            VecInt.push(self->break_stack, end_lbl);
+            VecInt.push(self->cont_stack, post_lbl);
+
+            if (self->emit == 1) { Codegen16.emit_label(self, cond_lbl); }
+
+            # cond
+            if (Codegen16.tok_punct1(self, *pos, 59) == 1) {
+                if (self->emit == 1) { Codegen16.emit_line(self, "    movw $1, %ax"); }
+                *pos is *pos + 1;
+            } else {
+                Codegen16.parse_expr(self, pos);
+                if (Codegen16.tok_punct1(self, *pos, 59) == 0) { Codegen16.error_at(self, "expected ';'", *pos); }
+                *pos is *pos + 1;
+            }
+
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    testw %ax, %ax");
+                Codegen16.emit_str(self, "    jz .L"); Codegen16.emit_dec(self, end_lbl); Codegen16.emit_nl(self);
+            }
+
+            # post: record start/end and parse after body
+            post_start is *pos;
+            while (*pos < self->tok_count) {
+                if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen16.tok_punct1(self, *pos, 41) == 1) { break; }
+                *pos is *pos + 1;
+            }
+            post_end is *pos;
+            if (Codegen16.tok_punct1(self, *pos, 41) == 0) { Codegen16.error_at(self, "expected ')'", *pos); }
+            *pos is *pos + 1;
+
+            bstart is 0; br is 0;
+            Codegen16.parse_block(self, pos, &bstart, &br);
+            Codegen16.parse_stmt_list(self, bstart, br);
+
+            if (self->emit == 1) { Codegen16.emit_label(self, post_lbl); }
+            if (post_start < post_end) {
+                ppos is post_start;
+                Codegen16.parse_bind_assign(self, &ppos, 41, 0);
+            }
+
+            if (self->emit == 1) {
+                Codegen16.emit_str(self, "    jmp .L"); Codegen16.emit_dec(self, cond_lbl); Codegen16.emit_nl(self);
+                Codegen16.emit_label(self, end_lbl);
+            }
+            VecInt.pop(self->break_stack);
+            VecInt.pop(self->cont_stack);
+            return;
+        }
+
+        if (Codegen16.tok_is_break(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1) {
+                n is VecInt.count(self->break_stack);
+                if (n <= 0) { cg16_error("break outside loop"); }
+                lbl is VecInt.get(self->break_stack, n - 1);
+                Codegen16.emit_str(self, "    jmp .L"); Codegen16.emit_dec(self, lbl); Codegen16.emit_nl(self);
+            }
+            return;
+        }
+
+        if (Codegen16.tok_is_continue(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1) {
+                n is VecInt.count(self->cont_stack);
+                if (n <= 0) { cg16_error("continue outside loop"); }
+                lbl is VecInt.get(self->cont_stack, n - 1);
+                Codegen16.emit_str(self, "    jmp .L"); Codegen16.emit_dec(self, lbl); Codegen16.emit_nl(self);
+            }
+            return;
+        }
+
+        if (Codegen16.tok_is_return(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { Codegen16.parse_expr(self, pos); }
+            else { if (self->emit == 1) { Codegen16.emit_line(self, "    xorw %ax, %ax"); } }
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1) {
+                Codegen16.emit_str(self, "    jmp .Lret_");
+                Codegen16.emit_dec(self, self->cur_ret_label);
+                Codegen16.emit_nl(self);
+            }
+            return;
+        }
+
+        if (Codegen16.tok_is_txtout(self, *pos) == 1 || Codegen16.tok_is_txtout_nl(self, *pos) == 1) {
+            emit_nl is Codegen16.tok_is_txtout(self, *pos);
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 40) == 0) { cg16_error("expected '('"); }
+            *pos is *pos + 1;
+            first is 1;
+            while (Codegen16.tok_punct1(self, *pos, 41) == 0) {
+                if (first == 0) { if (Codegen16.tok_punct1(self, *pos, 44) == 0) { cg16_error("expected ','"); } *pos is *pos + 1; }
+                first is 0;
+                ty is Codegen16.parse_expr(self, pos);
+                if (self->emit == 1) {
+                    if (ty == TY_STRING) {
+                        Codegen16.emit_line(self, "    pushw %ax");
+                        Codegen16.emit_line(self, "    call __zinc_rt_print_str");
+                        Codegen16.emit_line(self, "    addw $2, %sp");
+                    } else {
+                        Codegen16.emit_line(self, "    pushw %ax");
+                        Codegen16.emit_line(self, "    call __zinc_rt_print_int");
+                        Codegen16.emit_line(self, "    addw $2, %sp");
+                    }
+                }
+            }
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1 && emit_nl == 1) { Codegen16.emit_line(self, "    call __zinc_rt_print_nl"); }
+            return;
+        }
+
+        if (Codegen16.tok_is_out(self, *pos) == 1 &&
+            *pos + 1 < self->tok_count &&
+            VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+            Codegen16.tok_punct1(self, *pos + 1, 40) == 1) {
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 40) == 0) { cg16_error("expected '('"); }
+            *pos is *pos + 1;
+            Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 41) == 0) { cg16_error("expected ')'"); }
+            *pos is *pos + 1;
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+            *pos is *pos + 1;
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); Codegen16.emit_line(self, "    call __zinc_rt_exit"); Codegen16.emit_line(self, "    addw $2, %sp"); }
+            return;
+        }
+
+        # Member assignment: obj(.|->)field is expr;
+        if (*pos + 3 < end &&
+            *pos + 3 < self->tok_count &&
+            VecToken.get_kind(self->toks, *pos) == TK_IDENT &&
+            VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+            (Codegen16.tok_punct1(self, *pos + 1, 46) == 1 || Codegen16.tok_punct2(self, *pos + 1, 45, 62) == 1) &&
+            VecToken.get_kind(self->toks, *pos + 2) == TK_IDENT &&
+            VecToken.get_kind(self->toks, *pos + 3) == TK_IDENT &&
+            Codegen16.tok_is_is(self, *pos + 3) == 1) {
+            obj_start is VecToken.get_start(self->toks, *pos);
+            obj_len is VecToken.get_len(self->toks, *pos);
+            vidx is Codegen16.vars_find(self, obj_start, obj_len);
+            if (vidx < 0) { cg16_error("unknown object"); }
+            obj_ty is Codegen16.vars_get_type(self, vidx);
+            cls is class_idx_from_ty16(obj_ty);
+            if (cls < 0) { cg16_error("member assign on non-object"); }
+
+            mem_start is VecToken.get_start(self->toks, *pos + 2);
+            mem_len is VecToken.get_len(self->toks, *pos + 2);
+            off is Codegen16.field_offset(self, cls, mem_start, mem_len);
+            if (off < 0) { Codegen16.error_at(self, "unknown field", *pos + 2); }
+
+            *pos is *pos + 4; # obj op member is
+            Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 59) == 0) { Codegen16.error_at(self, "expected ';'", *pos); }
+            *pos is *pos + 1;
+
+            if (self->emit == 1) {
+                voff is Codegen16.vars_get_off(self, vidx);
+                Codegen16.emit_str(self, "    movw -");
+                Codegen16.emit_dec(self, voff);
+                Codegen16.emit_line(self, "(%bp), %bx");
+                Codegen16.emit_str(self, "    movw %ax, ");
+                Codegen16.emit_dec(self, off);
+                Codegen16.emit_line(self, "(%bx)");
+            }
+            return;
+        }
+
+        # binding/assignment statement
+        if (Codegen16.tok_is_int_kw(self, *pos) == 1 || Codegen16.tok_is_string_kw(self, *pos) == 1 ||
+            (VecToken.get_kind(self->toks, *pos) == TK_IDENT && *pos + 1 < self->tok_count && Codegen16.tok_is_is(self, *pos + 1) == 1)) {
+            Codegen16.parse_bind_assign(self, pos, 59, 1);
+            return;
+        }
+
+        # expression statement
+        Codegen16.parse_expr(self, pos);
+        if (Codegen16.tok_punct1(self, *pos, 59) == 0) { cg16_error("expected ';'"); }
+        *pos is *pos + 1;
+    }
+
+    func void parse_stmt_list(int* self, int start, int end) {
+        pos is start;
+        while (pos < end) { Codegen16.parse_stmt(self, &pos, end); }
+    }
+
+    # ===== function scanning / compile =====
+    func int find_main_body(int* self, int* out_lbrace, int* out_rbrace) {
+        i is 0;
+        while (i < self->tok_count && VecToken.get_kind(self->toks, i) != TK_EOF) {
+            if (i + 2 < self->tok_count) {
+                if (Codegen16.tok_is_func(self, i) == 0) { i is i + 1; continue; }
+                if (Codegen16.tok_is_int_kw(self, i + 1) == 0) { i is i + 1; continue; }
+                if (Codegen16.tok_is_main(self, i + 2) == 0) { i is i + 1; continue; }
+                j is i + 3;
+                while (j < self->tok_count && VecToken.get_kind(self->toks, j) != TK_EOF) {
+                    if (Codegen16.tok_punct1(self, j, 123) == 1) {
+                        *out_lbrace is j;
+                        depth is 1;
+                        k is j + 1;
+                        while (k < self->tok_count && VecToken.get_kind(self->toks, k) != TK_EOF && depth > 0) {
+                            if (VecToken.get_kind(self->toks, k) == TK_PUNCT) {
+                                if (Codegen16.tok_punct1(self, k, 123) == 1) { depth is depth + 1; }
+                                else if (Codegen16.tok_punct1(self, k, 125) == 1) { depth is depth - 1; }
+                            }
+                            k is k + 1;
+                        }
+                        if (depth != 0) { return 0; }
+                        *out_rbrace is k - 1;
+                        return 1;
+                    }
+                    j is j + 1;
+                }
+            }
+            i is i + 1;
+        }
+        return 0;
+    }
+
+    func void emit_runtime(int* self) {
+        Codegen16.emit_line(self, "");
+        Codegen16.emit_line(self, "__zinc_rt_exit:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    movb 4(%bp), %al");
+        Codegen16.emit_line(self, "    movb $0x4c, %ah");
+        Codegen16.emit_line(self, "    int $0x21");
+        Codegen16.emit_line(self, "");
+
+        Codegen16.emit_line(self, "__zinc_rt_print_char:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    movb 4(%bp), %dl");
+        Codegen16.emit_line(self, "    movb $0x02, %ah");
+        Codegen16.emit_line(self, "    int $0x21");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+        Codegen16.emit_line(self, "");
+
+        Codegen16.emit_line(self, "__zinc_rt_print_nl:");
+        Codegen16.emit_line(self, "    pushw $13");
+        Codegen16.emit_line(self, "    call __zinc_rt_print_char");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    pushw $10");
+        Codegen16.emit_line(self, "    call __zinc_rt_print_char");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    ret");
+        Codegen16.emit_line(self, "");
+
+        # print_str(char*): zero-terminated
+        Codegen16.emit_line(self, "__zinc_rt_print_str:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %si");
+        Codegen16.emit_line(self, "    movw 4(%bp), %si");
+        Codegen16.emit_line(self, ".Lps_loop:");
+        Codegen16.emit_line(self, "    movb (%si), %al");
+        Codegen16.emit_line(self, "    testb %al, %al");
+        Codegen16.emit_line(self, "    jz .Lps_done");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    call __zinc_rt_print_char");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    incw %si");
+        Codegen16.emit_line(self, "    jmp .Lps_loop");
+        Codegen16.emit_line(self, ".Lps_done:");
+        Codegen16.emit_line(self, "    popw %si");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+        Codegen16.emit_line(self, "");
+
+        # print_int(int): prints signed AX decimal
+        Codegen16.emit_line(self, "__zinc_rt_print_int:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    pushw %bx");
+        Codegen16.emit_line(self, "    pushw %cx");
+        Codegen16.emit_line(self, "    pushw %dx");
+        Codegen16.emit_line(self, "    movw 4(%bp), %ax");
+        Codegen16.emit_line(self, "    cmpw $0, %ax");
+        Codegen16.emit_line(self, "    jge .Lpi_abs");
+        Codegen16.emit_line(self, "    negw %ax");
+        Codegen16.emit_line(self, "    pushw $45");
+        Codegen16.emit_line(self, "    call __zinc_rt_print_char");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, ".Lpi_abs:");
+        Codegen16.emit_line(self, "    xorw %cx, %cx");
+        Codegen16.emit_line(self, "    movw $10, %bx");
+        Codegen16.emit_line(self, ".Lpi_div:");
+        Codegen16.emit_line(self, "    xorw %dx, %dx");
+        Codegen16.emit_line(self, "    divw %bx");
+        Codegen16.emit_line(self, "    pushw %dx");
+        Codegen16.emit_line(self, "    incw %cx");
+        Codegen16.emit_line(self, "    testw %ax, %ax");
+        Codegen16.emit_line(self, "    jnz .Lpi_div");
+        Codegen16.emit_line(self, ".Lpi_out:");
+        Codegen16.emit_line(self, "    popw %dx");
+        Codegen16.emit_line(self, "    addb $48, %dl");
+        Codegen16.emit_line(self, "    pushw %dx");
+        Codegen16.emit_line(self, "    call __zinc_rt_print_char");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    decw %cx");
+        Codegen16.emit_line(self, "    jnz .Lpi_out");
+        Codegen16.emit_line(self, "    popw %dx");
+        Codegen16.emit_line(self, "    popw %cx");
+        Codegen16.emit_line(self, "    popw %bx");
+        Codegen16.emit_line(self, "    popw %ax");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+        Codegen16.emit_line(self, "");
+
+        # strcmp(a,b): returns 0 if equal, <0, >0 (like C)
+        Codegen16.emit_line(self, "__zinc_rt_strcmp:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %si");
+        Codegen16.emit_line(self, "    pushw %di");
+        Codegen16.emit_line(self, "    movw 4(%bp), %si");
+        Codegen16.emit_line(self, "    movw 6(%bp), %di");
+        Codegen16.emit_line(self, ".Lsc_loop:");
+        Codegen16.emit_line(self, "    movb (%si), %al");
+        Codegen16.emit_line(self, "    movb (%di), %bl");
+        Codegen16.emit_line(self, "    cmpb %bl, %al");
+        Codegen16.emit_line(self, "    jne .Lsc_diff");
+        Codegen16.emit_line(self, "    testb %al, %al");
+        Codegen16.emit_line(self, "    jz .Lsc_eq");
+        Codegen16.emit_line(self, "    incw %si");
+        Codegen16.emit_line(self, "    incw %di");
+        Codegen16.emit_line(self, "    jmp .Lsc_loop");
+        Codegen16.emit_line(self, ".Lsc_diff:");
+        Codegen16.emit_line(self, "    movzbw %al, %ax");
+        Codegen16.emit_line(self, "    movzbw %bl, %bx");
+        Codegen16.emit_line(self, "    subw %bx, %ax");
+        Codegen16.emit_line(self, "    jmp .Lsc_ret");
+        Codegen16.emit_line(self, ".Lsc_eq:");
+        Codegen16.emit_line(self, "    xorw %ax, %ax");
+        Codegen16.emit_line(self, ".Lsc_ret:");
+        Codegen16.emit_line(self, "    popw %di");
+        Codegen16.emit_line(self, "    popw %si");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+        Codegen16.emit_line(self, "");
+    }
+
+    func void emit_class_helpers(int* self) {
+        nc is Codegen16.classes_count(self);
+        for (int ci is 0; ci < nc; ci is ci + 1) {
+            cname_start is Codegen16.classes_get_name_start(self, ci);
+            cname_len is Codegen16.classes_get_name_len(self, ci);
+            sz is Codegen16.classes_get_size(self, ci);
+
+            Codegen16.emit_line(self, "");
+            Codegen16.emit_str(self, "__zn_new_");
+            file_write(self->fd, self->src + cname_start, cname_len);
+            Codegen16.emit_line(self, ":");
+            Codegen16.emit_line(self, "    pushw %bp");
+            Codegen16.emit_line(self, "    movw %sp, %bp");
+            Codegen16.emit_str(self, "    pushw $");
+            Codegen16.emit_dec(self, sz);
+            Codegen16.emit_nl(self);
+            Codegen16.emit_line(self, "    call __zinc_rt_malloc");
+            Codegen16.emit_line(self, "    addw $2, %sp");
+            # memset(ptr,0,sz)
+            Codegen16.emit_str(self, "    pushw $");
+            Codegen16.emit_dec(self, sz);
+            Codegen16.emit_nl(self);
+            Codegen16.emit_line(self, "    pushw $0");
+            Codegen16.emit_line(self, "    pushw %ax");
+            Codegen16.emit_line(self, "    call __zinc_rt_memset");
+            Codegen16.emit_line(self, "    addw $6, %sp");
+            Codegen16.emit_line(self, "    movw %bp, %sp");
+            Codegen16.emit_line(self, "    popw %bp");
+            Codegen16.emit_line(self, "    ret");
+
+            Codegen16.emit_line(self, "");
+            Codegen16.emit_str(self, "__zn_copy_");
+            file_write(self->fd, self->src + cname_start, cname_len);
+            Codegen16.emit_line(self, ":");
+            Codegen16.emit_line(self, "    pushw %bp");
+            Codegen16.emit_line(self, "    movw %sp, %bp");
+            Codegen16.emit_line(self, "    pushw %bx");
+            Codegen16.emit_line(self, "    movw 4(%bp), %bx");
+            Codegen16.emit_str(self, "    pushw $");
+            Codegen16.emit_dec(self, sz);
+            Codegen16.emit_nl(self);
+            Codegen16.emit_line(self, "    call __zinc_rt_malloc");
+            Codegen16.emit_line(self, "    addw $2, %sp");
+            # memcpy(dst=ax, src=bx, n=sz)
+            Codegen16.emit_str(self, "    pushw $");
+            Codegen16.emit_dec(self, sz);
+            Codegen16.emit_nl(self);
+            Codegen16.emit_line(self, "    pushw %bx");
+            Codegen16.emit_line(self, "    pushw %ax");
+            Codegen16.emit_line(self, "    call __zinc_rt_memcpy");
+            Codegen16.emit_line(self, "    addw $6, %sp");
+            Codegen16.emit_line(self, "    popw %bx");
+            Codegen16.emit_line(self, "    movw %bp, %sp");
+            Codegen16.emit_line(self, "    popw %bp");
+            Codegen16.emit_line(self, "    ret");
+        }
+    }
+
+    func void compile(int* self, string out_path) {
+        fd is file_open_write(out_path);
+        if (fd == -1) { cg16_error("failed to open output"); }
+        self->fd is fd;
+
+        funcs is VecInt(); VecInt.init(funcs);
+        globals is VecInt(); VecInt.init(globals);
+        classes is VecInt(); VecInt.init(classes);
+        fields is VecInt(); VecInt.init(fields);
+        self->fns is funcs;
+        self->globals is globals;
+        self->classes is classes;
+        self->fields is fields;
+
+        func_locals is VecInt(); VecInt.init(func_locals);
+        func_params is VecInt(); VecInt.init(func_params);
+        func_retlabels is VecInt(); VecInt.init(func_retlabels);
+
+        # Scan top-level for classes, methods, and funcs.
+        pos is 0;
+        while (pos < self->tok_count && VecToken.get_kind(self->toks, pos) != TK_EOF) {
+            if (Codegen16.tok_is_class_kw(self, pos) == 1) {
+                if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg16_error("expected class name"); }
+                cname_start is VecToken.get_start(self->toks, pos + 1);
+                cname_len is VecToken.get_len(self->toks, pos + 1);
+
+                p is pos + 2;
+                while (p < self->tok_count && !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen16.tok_punct1(self, p, 123) == 1)) { p is p + 1; }
+                if (p >= self->tok_count) { cg16_error("expected '{' after class"); }
+                body_lbrace is p;
+                depth is 1;
+                p is p + 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen16.tok_punct1(self, p, 123) == 1) { depth is depth + 1; }
+                        else if (Codegen16.tok_punct1(self, p, 125) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg16_error("unterminated class body"); }
+                body_rbrace is p - 1;
+
+                class_idx is VecInt.count(classes) / 3;
+                VecInt.push(classes, cname_start);
+                VecInt.push(classes, cname_len);
+                VecInt.push(classes, 0);
+
+                fieldc is 0;
+                i is body_lbrace + 1;
+                while (i < body_rbrace) {
+                    if (i + 2 < body_rbrace && Codegen16.tok_is_func(self, i) == 1) {
+                        if (VecToken.get_kind(self->toks, i + 1) != TK_IDENT) { cg16_error("expected return type"); }
+                        if (VecToken.get_kind(self->toks, i + 2) != TK_IDENT) { cg16_error("expected method name"); }
+                        ret_ty is TY_INT;
+                        if (Codegen16.tok_is_void_kw(self, i + 1) == 1) { ret_ty is TY_VOID; }
+                        else if (Codegen16.tok_is_string_kw(self, i + 1) == 1) { ret_ty is TY_STRING; }
+
+                        mname_start is VecToken.get_start(self->toks, i + 2);
+                        mname_len is VecToken.get_len(self->toks, i + 2);
+
+                        mp is i + 3;
+                        while (mp < self->tok_count && !(VecToken.get_kind(self->toks, mp) == TK_PUNCT && Codegen16.tok_punct1(self, mp, 40) == 1)) { mp is mp + 1; }
+                        if (mp >= self->tok_count) { Codegen16.error_at(self, "expected '('", mp); }
+                        param_start is mp + 1;
+                        depth2 is 1;
+                        mp is mp + 1;
+                        while (mp < self->tok_count && depth2 > 0) {
+                            if (VecToken.get_kind(self->toks, mp) == TK_PUNCT) {
+                                if (Codegen16.tok_punct1(self, mp, 40) == 1) { depth2 is depth2 + 1; }
+                                else if (Codegen16.tok_punct1(self, mp, 41) == 1) { depth2 is depth2 - 1; }
+                            }
+                            mp is mp + 1;
+                        }
+                        if (depth2 != 0) { cg16_error("unterminated param list"); }
+                        param_end is mp - 1;
+
+                        while (mp < self->tok_count && !(VecToken.get_kind(self->toks, mp) == TK_PUNCT && Codegen16.tok_punct1(self, mp, 123) == 1)) { mp is mp + 1; }
+                        if (mp >= self->tok_count) { cg16_error("expected '{'"); }
+                        body_start is mp + 1;
+                        depth3 is 1;
+                        mp is mp + 1;
+                        while (mp < self->tok_count && depth3 > 0) {
+                            if (VecToken.get_kind(self->toks, mp) == TK_PUNCT) {
+                                if (Codegen16.tok_punct1(self, mp, 123) == 1) { depth3 is depth3 + 1; }
+                                else if (Codegen16.tok_punct1(self, mp, 125) == 1) { depth3 is depth3 - 1; }
+                            }
+                            mp is mp + 1;
+                        }
+                        if (depth3 != 0) { cg16_error("unterminated method body"); }
+                        body_end is mp - 1;
+
+                        is_instance is 0;
+                        if (param_start < param_end && VecToken.get_kind(self->toks, param_start) == TK_IDENT) {
+                            pp is param_start + 1;
+                            starc is 0;
+                            while (pp < param_end && VecToken.get_kind(self->toks, pp) == TK_PUNCT && Codegen16.tok_punct1(self, pp, 42) == 1) { starc is starc + 1; pp is pp + 1; }
+                            if (starc > 0) { is_instance is 1; }
+                        }
+
+                        VecInt.push(funcs, 1);
+                        VecInt.push(funcs, class_idx);
+                        VecInt.push(funcs, cname_start);
+                        VecInt.push(funcs, cname_len);
+                        VecInt.push(funcs, mname_start);
+                        VecInt.push(funcs, mname_len);
+                        VecInt.push(funcs, ret_ty);
+                        VecInt.push(funcs, param_start);
+                        VecInt.push(funcs, param_end);
+                        VecInt.push(funcs, body_start);
+                        VecInt.push(funcs, body_end);
+                        VecInt.push(funcs, is_instance);
+                        i is body_end + 1;
+                        continue;
+                    }
+
+                    # Field: <type> '*'* <name> ;
+                    if (VecToken.get_kind(self->toks, i) == TK_IDENT) {
+                        j is i + 1;
+                        while (j < body_rbrace && VecToken.get_kind(self->toks, j) == TK_PUNCT && Codegen16.tok_punct1(self, j, 42) == 1) { j is j + 1; }
+                        if (j + 1 < body_rbrace &&
+                            VecToken.get_kind(self->toks, j) == TK_IDENT &&
+                            VecToken.get_kind(self->toks, j + 1) == TK_PUNCT &&
+                            Codegen16.tok_punct1(self, j + 1, 59) == 1) {
+                            fname_start is VecToken.get_start(self->toks, j);
+                            fname_len is VecToken.get_len(self->toks, j);
+                            VecInt.push(fields, class_idx);
+                            VecInt.push(fields, fname_start);
+                            VecInt.push(fields, fname_len);
+                            VecInt.push(fields, fieldc * 2);
+                            fieldc is fieldc + 1;
+                            i is j + 2;
+                            continue;
+                        }
+                    }
+
+                    i is i + 1;
+                }
+                VecInt.set(classes, class_idx * 3 + 2, fieldc * 2);
+                pos is body_rbrace + 1;
+                continue;
+            }
+
+            if (Codegen16.tok_is_func(self, pos) == 1) {
+                if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg16_error("expected return type"); }
+                if (VecToken.get_kind(self->toks, pos + 2) != TK_IDENT) { cg16_error("expected function name"); }
+                ret_ty is TY_INT;
+                if (Codegen16.tok_is_void_kw(self, pos + 1) == 1) { ret_ty is TY_VOID; }
+                else if (Codegen16.tok_is_string_kw(self, pos + 1) == 1) { ret_ty is TY_STRING; }
+                name_start is VecToken.get_start(self->toks, pos + 2);
+                name_len is VecToken.get_len(self->toks, pos + 2);
+
+                p is pos + 3;
+                while (p < self->tok_count && !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen16.tok_punct1(self, p, 40) == 1)) { p is p + 1; }
+                if (p >= self->tok_count) { Codegen16.error_at(self, "expected '('", p); }
+                param_start is p + 1;
+                depth is 1;
+                p is p + 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen16.tok_punct1(self, p, 40) == 1) { depth is depth + 1; }
+                        else if (Codegen16.tok_punct1(self, p, 41) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg16_error("unterminated param list"); }
+                param_end is p - 1;
+                while (p < self->tok_count && !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen16.tok_punct1(self, p, 123) == 1)) { p is p + 1; }
+                if (p >= self->tok_count) { cg16_error("expected '{'"); }
+                body_start is p + 1;
+                depth is 1;
+                p is p + 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen16.tok_punct1(self, p, 123) == 1) { depth is depth + 1; }
+                        else if (Codegen16.tok_punct1(self, p, 125) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg16_error("unterminated function body"); }
+                body_end is p - 1;
+
+                VecInt.push(funcs, 0);
+                VecInt.push(funcs, -1);
+                VecInt.push(funcs, 0);
+                VecInt.push(funcs, 0);
+                VecInt.push(funcs, name_start);
+                VecInt.push(funcs, name_len);
+                VecInt.push(funcs, ret_ty);
+                VecInt.push(funcs, param_start);
+                VecInt.push(funcs, param_end);
+                VecInt.push(funcs, body_start);
+                VecInt.push(funcs, body_end);
+                VecInt.push(funcs, 0);
+                pos is body_end + 1;
+                continue;
+            }
+
+            pos is pos + 1;
+        }
+
+        fn_count is VecInt.count(funcs) / 12;
+        for (int fi is 0; fi < fn_count; fi is fi + 1) {
+            fn_kind is VecInt.get(funcs, fi * 12 + 0);
+            fn_class_idx is VecInt.get(funcs, fi * 12 + 1);
+            fn_is_instance is VecInt.get(funcs, fi * 12 + 11);
+
+            VecInt.clear(self->vars);
+            VecInt.clear(self->break_stack);
+            VecInt.clear(self->cont_stack);
+            self->cur_fn_class_idx is fn_class_idx;
+            self->cur_fn_is_instance is fn_is_instance;
+            self->cur_self_off is 0;
+
+            # Params: stored in locals at -off(%bp)
+            pstart is VecInt.get(funcs, fi * 12 + 7);
+            pend is VecInt.get(funcs, fi * 12 + 8);
+            ppos is pstart;
+            paramc is 0;
+            while (ppos < pend) {
+                if (VecToken.get_kind(self->toks, ppos) != TK_IDENT) { break; }
+                base_is_string is Codegen16.tok_is_string_kw(self, ppos);
+                base_is_char is Codegen16.tok_is_lit(self, ppos, "char");
+                pty is TY_INT;
+                if (base_is_string == 1) { pty is TY_STRING; }
+                ppos is ppos + 1;
+                starc is 0;
+                while (VecToken.get_kind(self->toks, ppos) == TK_PUNCT && Codegen16.tok_punct1(self, ppos, 42) == 1) { starc is starc + 1; ppos is ppos + 1; }
+                if (VecToken.get_kind(self->toks, ppos) != TK_IDENT) { break; }
+                ns is VecToken.get_start(self->toks, ppos);
+                nl is VecToken.get_len(self->toks, ppos);
+                ppos is ppos + 1;
+                has_arr is 0;
+                if (VecToken.get_kind(self->toks, ppos) == TK_PUNCT && Codegen16.tok_punct1(self, ppos, 91) == 1) {
+                    if (Codegen16.tok_punct1(self, ppos + 1, 93) == 1) { ppos is ppos + 2; }
+                    has_arr is 1;
+                }
+
+                if (fn_kind == 1 && fn_is_instance == 1 && paramc == 0) {
+                    pty is TY_CLASS_BASE + fn_class_idx;
+                } else if (base_is_char == 1 && starc > 0 && has_arr == 1) {
+                    pty is TY_STR_ARR;
+                } else if (base_is_char == 1 && starc > 0) {
+                    pty is TY_STRING;
+                }
+
+                off is (paramc + 1) * 2;
+                Codegen16.vars_add(self, ns, nl, pty, off, 0);
+                if (fn_kind == 1 && fn_is_instance == 1 && paramc == 0) { self->cur_self_off is off; }
+                paramc is paramc + 1;
+                if (VecToken.get_kind(self->toks, ppos) == TK_PUNCT && Codegen16.tok_punct1(self, ppos, 44) == 1) { ppos is ppos + 1; continue; }
+                break;
+            }
+
+            self->emit is 0;
+            self->cur_ret_label is self->label_counter;
+            self->label_counter is self->label_counter + 1;
+            VecInt.push(func_retlabels, self->cur_ret_label);
+
+            bstart is VecInt.get(funcs, fi * 12 + 9);
+            bend is VecInt.get(funcs, fi * 12 + 10);
+            Codegen16.parse_stmt_list(self, bstart, bend);
+
+            local_bytes is Codegen16.vars_count(self) * 2;
+            VecInt.push(func_locals, local_bytes);
+            VecInt.push(func_params, paramc);
+        }
+
+        # Emit program + data + helpers + all functions
+        Codegen16.emit_line(self, ".code16gcc");
+        Codegen16.emit_line(self, ".text");
+        Codegen16.emit_line(self, ".globl _start");
+        Codegen16.emit_line(self, "_start:");
+        Codegen16.emit_line(self, "    pushw %cs");
+        Codegen16.emit_line(self, "    popw %ds");
+        Codegen16.emit_line(self, "    pushw %cs");
+        Codegen16.emit_line(self, "    popw %ss");
+        Codegen16.emit_line(self, "    movw $0xfffe, %sp");
+        Codegen16.emit_line(self, "    xorw %ax, %ax");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    call main");
+        Codegen16.emit_line(self, "    addw $4, %sp");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    call __zinc_rt_exit");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+
+        Codegen16.emit_line(self, "");
+        Codegen16.emit_line(self, ".section .bss");
+        Codegen16.emit_line(self, ".align 2");
+        Codegen16.emit_line(self, "__zn_heap_mem: .skip 32768");
+        Codegen16.emit_line(self, "__zn_heap_ptr: .word __zn_heap_mem");
+        Codegen16.emit_line(self, "__zn_txtin_buf: .byte 255,0");
+        Codegen16.emit_line(self, "__zn_txtin_data: .skip 255");
+
+        Codegen16.emit_line(self, "");
+        Codegen16.emit_line(self, ".section .rodata");
+        sc is Codegen16.strtab_count(self);
+        for (int si is 0; si < sc; si is si + 1) {
+            Codegen16.emit_asm_string_escaped(self, si, Codegen16.strtab_get_start(self, si), Codegen16.strtab_get_len(self, si));
+        }
+
+        Codegen16.emit_line(self, "");
+        Codegen16.emit_line(self, ".text");
+        Codegen16.emit_runtime(self);
+        Codegen16.emit_class_helpers(self);
+
+        # Memory/runtime helpers needed by class construction and stdlib-like calls.
+        Codegen16.emit_line(self, "__zinc_rt_malloc:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    movw 4(%bp), %cx");
+        Codegen16.emit_line(self, "    movw __zn_heap_ptr, %ax");
+        Codegen16.emit_line(self, "    movw %ax, %dx");
+        Codegen16.emit_line(self, "    addw %cx, %ax");
+        Codegen16.emit_line(self, "    movw %ax, __zn_heap_ptr");
+        Codegen16.emit_line(self, "    movw %dx, %ax");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+
+        Codegen16.emit_line(self, "__zinc_rt_free:");
+        Codegen16.emit_line(self, "    ret");
+
+        Codegen16.emit_line(self, "__zinc_rt_memset:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %di");
+        Codegen16.emit_line(self, "    movw 4(%bp), %di");
+        Codegen16.emit_line(self, "    movb 6(%bp), %al");
+        Codegen16.emit_line(self, "    movw 8(%bp), %cx");
+        Codegen16.emit_line(self, "    rep stosb");
+        Codegen16.emit_line(self, "    movw 4(%bp), %ax");
+        Codegen16.emit_line(self, "    popw %di");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+
+        Codegen16.emit_line(self, "__zinc_rt_memcpy:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %si");
+        Codegen16.emit_line(self, "    pushw %di");
+        Codegen16.emit_line(self, "    movw 4(%bp), %di");
+        Codegen16.emit_line(self, "    movw 6(%bp), %si");
+        Codegen16.emit_line(self, "    movw 8(%bp), %cx");
+        Codegen16.emit_line(self, "    rep movsb");
+        Codegen16.emit_line(self, "    movw 4(%bp), %ax");
+        Codegen16.emit_line(self, "    popw %di");
+        Codegen16.emit_line(self, "    popw %si");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+
+        Codegen16.emit_line(self, "__zinc_rt_strlen:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %si");
+        Codegen16.emit_line(self, "    movw 4(%bp), %si");
+        Codegen16.emit_line(self, "    xorw %cx, %cx");
+        Codegen16.emit_line(self, ".Lsl_loop:");
+        Codegen16.emit_line(self, "    movb (%si), %al");
+        Codegen16.emit_line(self, "    testb %al, %al");
+        Codegen16.emit_line(self, "    jz .Lsl_done");
+        Codegen16.emit_line(self, "    incw %si");
+        Codegen16.emit_line(self, "    incw %cx");
+        Codegen16.emit_line(self, "    jmp .Lsl_loop");
+        Codegen16.emit_line(self, ".Lsl_done:");
+        Codegen16.emit_line(self, "    movw %cx, %ax");
+        Codegen16.emit_line(self, "    popw %si");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+
+        Codegen16.emit_line(self, "__zinc_rt_strdup:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    pushw %bx");
+        Codegen16.emit_line(self, "    movw 4(%bp), %bx");
+        Codegen16.emit_line(self, "    pushw %bx");
+        Codegen16.emit_line(self, "    call __zinc_rt_strlen");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    incw %ax");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    call __zinc_rt_malloc");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    movw %ax, %dx");
+        Codegen16.emit_line(self, "    pushw %bx");
+        Codegen16.emit_line(self, "    pushw %dx");
+        Codegen16.emit_line(self, "    call __zinc_rt_strlen");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    incw %ax");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    pushw %bx");
+        Codegen16.emit_line(self, "    pushw %dx");
+        Codegen16.emit_line(self, "    call __zinc_rt_memcpy");
+        Codegen16.emit_line(self, "    addw $6, %sp");
+        Codegen16.emit_line(self, "    movw %dx, %ax");
+        Codegen16.emit_line(self, "    popw %bx");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+
+        Codegen16.emit_line(self, "txtin:");
+        Codegen16.emit_line(self, "    pushw %bp");
+        Codegen16.emit_line(self, "    movw %sp, %bp");
+        Codegen16.emit_line(self, "    movw $__zn_txtin_buf, %dx");
+        Codegen16.emit_line(self, "    movb $0x0a, %ah");
+        Codegen16.emit_line(self, "    int $0x21");
+        Codegen16.emit_line(self, "    movzbw __zn_txtin_buf+1, %ax");
+        Codegen16.emit_line(self, "    incw %ax");
+        Codegen16.emit_line(self, "    pushw %ax");
+        Codegen16.emit_line(self, "    call __zinc_rt_malloc");
+        Codegen16.emit_line(self, "    addw $2, %sp");
+        Codegen16.emit_line(self, "    movw %ax, %di");
+        Codegen16.emit_line(self, "    movzbw __zn_txtin_buf+1, %cx");
+        Codegen16.emit_line(self, "    movw $__zn_txtin_data, %si");
+        Codegen16.emit_line(self, "    rep movsb");
+        Codegen16.emit_line(self, "    movb $0, (%di)");
+        Codegen16.emit_line(self, "    movw %ax, %ax");
+        Codegen16.emit_line(self, "    popw %bp");
+        Codegen16.emit_line(self, "    ret");
+
+        # Emit all functions/methods.
+        for (int fi2 is 0; fi2 < fn_count; fi2 is fi2 + 1) {
+            local_bytes2 is VecInt.get(func_locals, fi2);
+            paramc2 is VecInt.get(func_params, fi2);
+            self->cur_ret_label is VecInt.get(func_retlabels, fi2);
+            fn_kind2 is VecInt.get(funcs, fi2 * 12 + 0);
+            fn_class_idx2 is VecInt.get(funcs, fi2 * 12 + 1);
+            fn_is_instance2 is VecInt.get(funcs, fi2 * 12 + 11);
+            self->cur_fn_class_idx is fn_class_idx2;
+            self->cur_fn_is_instance is fn_is_instance2;
+            self->cur_self_off is 0;
+
+            Codegen16.emit_line(self, "");
+            Codegen16.emit_fn_symbol(self, fi2);
+            Codegen16.emit_line(self, ":");
+            Codegen16.emit_line(self, "    pushw %bp");
+            Codegen16.emit_line(self, "    movw %sp, %bp");
+            if (local_bytes2 > 0) {
+                Codegen16.emit_str(self, "    subw $");
+                Codegen16.emit_dec(self, local_bytes2);
+                Codegen16.emit_line(self, ", %sp");
+            }
+
+            # Rebuild var table and move args into stack slots.
+            VecInt.clear(self->vars);
+            VecInt.clear(self->break_stack);
+            VecInt.clear(self->cont_stack);
+
+            pstart2 is VecInt.get(funcs, fi2 * 12 + 7);
+            pend2 is VecInt.get(funcs, fi2 * 12 + 8);
+            ppos2 is pstart2;
+            pi2 is 0;
+            while (ppos2 < pend2) {
+                if (VecToken.get_kind(self->toks, ppos2) != TK_IDENT) { break; }
+                base_is_string2 is Codegen16.tok_is_string_kw(self, ppos2);
+                base_is_char2 is Codegen16.tok_is_lit(self, ppos2, "char");
+                pty2 is TY_INT;
+                if (base_is_string2 == 1) { pty2 is TY_STRING; }
+                ppos2 is ppos2 + 1;
+                starc2 is 0;
+                while (VecToken.get_kind(self->toks, ppos2) == TK_PUNCT && Codegen16.tok_punct1(self, ppos2, 42) == 1) { starc2 is starc2 + 1; ppos2 is ppos2 + 1; }
+                if (VecToken.get_kind(self->toks, ppos2) != TK_IDENT) { break; }
+                ns2 is VecToken.get_start(self->toks, ppos2);
+                nl2 is VecToken.get_len(self->toks, ppos2);
+                ppos2 is ppos2 + 1;
+                has_arr2 is 0;
+                if (VecToken.get_kind(self->toks, ppos2) == TK_PUNCT && Codegen16.tok_punct1(self, ppos2, 91) == 1) {
+                    if (Codegen16.tok_punct1(self, ppos2 + 1, 93) == 1) { ppos2 is ppos2 + 2; }
+                    has_arr2 is 1;
+                }
+                if (fn_kind2 == 1 && fn_is_instance2 == 1 && pi2 == 0) { pty2 is TY_CLASS_BASE + fn_class_idx2; }
+                else if (base_is_char2 == 1 && starc2 > 0 && has_arr2 == 1) { pty2 is TY_STR_ARR; }
+                else if (base_is_char2 == 1 && starc2 > 0) { pty2 is TY_STRING; }
+                off2 is (pi2 + 1) * 2;
+                Codegen16.vars_add(self, ns2, nl2, pty2, off2, 0);
+                if (fn_kind2 == 1 && fn_is_instance2 == 1 && pi2 == 0) { self->cur_self_off is off2; }
+
+                Codegen16.emit_str(self, "    movw ");
+                Codegen16.emit_dec(self, 4 + pi2 * 2);
+                Codegen16.emit_line(self, "(%bp), %ax");
+                Codegen16.emit_str(self, "    movw %ax, -");
+                Codegen16.emit_dec(self, off2);
+                Codegen16.emit_line(self, "(%bp)");
+
+                pi2 is pi2 + 1;
+                if (VecToken.get_kind(self->toks, ppos2) == TK_PUNCT && Codegen16.tok_punct1(self, ppos2, 44) == 1) { ppos2 is ppos2 + 1; continue; }
+                break;
+            }
+
+            self->emit is 1;
+            bstart2 is VecInt.get(funcs, fi2 * 12 + 9);
+            bend2 is VecInt.get(funcs, fi2 * 12 + 10);
+            Codegen16.parse_stmt_list(self, bstart2, bend2);
+
+            Codegen16.emit_line(self, "    xorw %ax, %ax");
+            Codegen16.emit_str(self, ".Lret_");
+            Codegen16.emit_dec(self, self->cur_ret_label);
+            Codegen16.emit_line(self, ":");
+            if (local_bytes2 > 0) {
+                Codegen16.emit_str(self, "    addw $");
+                Codegen16.emit_dec(self, local_bytes2);
+                Codegen16.emit_line(self, ", %sp");
+            }
+            Codegen16.emit_line(self, "    movw %bp, %sp");
+            Codegen16.emit_line(self, "    popw %bp");
+            Codegen16.emit_line(self, "    ret");
+
+            self->emit is 0;
+        }
+
+        file_close(fd);
+        self->fd is 0;
+        VecInt.destroy(funcs); VecInt.destroy(globals); VecInt.destroy(classes); VecInt.destroy(fields);
+        VecInt.destroy(func_locals); VecInt.destroy(func_params); VecInt.destroy(func_retlabels);
+        free(funcs); free(globals); free(classes); free(fields);
+        free(func_locals); free(func_params); free(func_retlabels);
+        free(self->scratch);
+        self->scratch is 0;
+    }
+}
+
+func void codegen16_basic(string src, int* toks, int tok_count, string out_path) {
+    cg is Codegen16();
+    Codegen16.init(cg, src, toks, tok_count);
+    Codegen16.compile(cg, out_path);
+}
