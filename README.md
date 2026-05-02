@@ -34,7 +34,7 @@ znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens]
 ```
 
 There's also a vscode extension for code highligting with Zinc!
-https://marketplace.visualstudio.com/items?itemName=warrick.zinc
+Download it [here](https://marketplace.visualstudio.com/items?itemName=warrick.zinc)
 
 ## Example
 
