@@ -18,7 +18,7 @@ Read the [wiki](https://github.com/Warrik2020/Zinc/wiki) for more info!
 
 ## Installation
 
-You need to have the GCC C++ compiler (for now)
+You need to have GCC installed for the linker!
 
 ```bash
 git clone https://github.com/Warrik2020/Zinc.git
