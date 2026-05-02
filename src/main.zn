@@ -563,15 +563,8 @@ func int main(int argc, char *argv[]) {
         free(stem);
     }
 
-    needs_wayland is contains_substr(combined, "__zn_wlwin_create");
     string cmd is "";
-    if (needs_wayland == 1) {
-        string cmd1 is str_concat4("cc ", asm_path, " runtime/wayland_shim.c runtime/xdg-shell-protocol.c ", "$(pkg-config --cflags --libs wayland-client)");
-        cmd is str_concat3(cmd1, " -o ", link_out);
-        free(cmd1);
-    } else {
-        cmd is str_concat4("cc ", asm_path, " -o ", link_out);
-    }
+    cmd is str_concat4("cc ", asm_path, " -o ", link_out);
     dbg_s("link cmd=", cmd);
     rc is rt_system(cmd);
     free(cmd);
