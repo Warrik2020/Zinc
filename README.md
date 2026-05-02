@@ -29,7 +29,7 @@ sudo make install
 ## Usage
 
 ```
-znc <input.zn> [-o output_file] [--out-dir dir] [--emit-asm|--emit-obj] [--run]
+znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens]
 ./<output_file>
 ```
 
