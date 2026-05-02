@@ -424,7 +424,7 @@ func string build_combined_source(string entry_path) {
 
 func int main(int argc, char *argv[]) {
     if (argc < 2) {
-        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--debug] [--debug-driver]");
+        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens]");
         out(1);
     }
 
