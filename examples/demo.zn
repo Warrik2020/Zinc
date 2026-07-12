@@ -94,6 +94,13 @@ func int main(int argc, char *argv[]) {
     free(math);
     free(math2);
 
+    example is 4;
+    example is example + "a";
+    # should error
+    txtout(example);
+
+    free(example);
+
     txtout("Done!");
     out(0);
 }

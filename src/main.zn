@@ -279,6 +279,12 @@ func void scan_header_and_strip(string abs_path, int* out_is_module, int* out_im
                         out(1);
                     }
                     is_mod is 1;
+                    string blank is newline_str();
+                    string tmp is str_concat2(out_src, blank);
+                    if (out_src_owned == 1) { free(out_src); }
+                    free(blank);
+                    out_src is tmp;
+                    out_src_owned is 1;
                     continue; # strip directive line
                 }
             }
@@ -294,6 +300,12 @@ func void scan_header_and_strip(string abs_path, int* out_is_module, int* out_im
                             string imp is zn_substr_copy(src, q1 + 1, q2 - (q1 + 1));
                             VecInt.push(imports, str_as_int(imp)); # freed in resolve_unit()
                             saw_import is 1;
+                            string blank is newline_str();
+                            string tmp is str_concat2(out_src, blank);
+                            if (out_src_owned == 1) { free(out_src); }
+                            free(blank);
+                            out_src is tmp;
+                            out_src_owned is 1;
                             continue; # strip directive line
                         }
                     }
@@ -383,6 +395,24 @@ func void resolve_unit(string abs_path,
     VecInt.push(order, idx);
 }
 
+func string unit_marker(string path) {
+    marker is str_concat2("#@zn_file ", path);
+    nl is rt_malloc(2);
+    rt_memset(nl, 10, 1);
+    rt_memset(nl + 1, 0, 1);
+    out is str_concat2(marker, nl);
+    free(marker);
+    free(nl);
+    return out;
+}
+
+func string newline_str() {
+    nl is rt_malloc(2);
+    rt_memset(nl, 10, 1);
+    rt_memset(nl + 1, 0, 1);
+    return nl;
+}
+
 func string build_combined_source(string entry_path) {
     dbg_s("build_combined_source entry=", entry_path);
     paths is VecInt();
@@ -401,11 +431,24 @@ func string build_combined_source(string entry_path) {
     n is VecInt.count(order);
     for (int i is 0; i < n; i is i + 1) {
         idx is VecInt.get(order, i);
+        path is int_as_str(VecInt.get(paths, idx));
         unit_src is int_as_str(VecInt.get(sources, idx));
-        string tmp1 is str_concat2(combined, unit_src);
-        if (combined_owned == 1) { free(combined); }
+        marker is unit_marker(path);
+        string tmp1 is str_concat2(combined, marker);
+        if (combined_owned == 1 && i == 0) { free(combined); }
         combined is tmp1;
         combined_owned is 1;
+        tmp2 is str_concat2(combined, unit_src);
+        free(combined);
+        combined is tmp2;
+        if (len(unit_src) == 0 || unit_src[len(unit_src) - 1] != 10) {
+            nl is newline_str();
+            tmp3 is str_concat2(combined, nl);
+            free(combined);
+            free(nl);
+            combined is tmp3;
+        }
+        free(marker);
     }
 
     if (combined_owned == 0) {
@@ -608,7 +651,7 @@ func int main(int argc, char *argv[]) {
     else { codegen_basic(combined, toks2, tok_count2, debug, bitness, asm_path); }
     dbg("codegen done");
     if (emit_asm == 1 || len(out_asm) > 0) {
-        txtout("Assembly written");
+        txtout("Assembly written: ", asm_path);
         out(0);
     }
 
@@ -632,11 +675,13 @@ func int main(int argc, char *argv[]) {
         rc is rt_system(cmd);
         free(cmd);
         dbg_i("link rc=", rc);
-        if (is_out_dir == 1) { free(link_out); }
         if (rc != 0) {
             txtout("link failed");
+            if (is_out_dir == 1) { free(link_out); }
             out(1);
         }
+        txtout("Built: ", link_out);
+        if (is_out_dir == 1) { free(link_out); }
     } else {
         # Raw x86-64: link an ELF, then extract a flat binary.
         string tmp_elf is str_concat2(link_out, ".elf");
@@ -660,13 +705,13 @@ func int main(int argc, char *argv[]) {
         free(objcopy_cmd);
         dbg_i("objcopy rc=", rc2);
         free(tmp_elf);
-        if (is_out_dir == 1) { free(link_out); }
         if (rc2 != 0) {
             txtout("objcopy failed");
+            if (is_out_dir == 1) { free(link_out); }
             out(1);
         }
+        txtout("Built: ", link_out);
+        if (is_out_dir == 1) { free(link_out); }
     }
-
-    txtout("Built");
     out(0);
 }

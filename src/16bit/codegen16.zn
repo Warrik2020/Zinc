@@ -30,13 +30,29 @@ private int TY_STR_ARR is 4; # char* argv[] (not meaningful in 16-bit, kept for 
 
 private int TY_CLASS_BASE is 1000;
 private int TY_CLASSREF_BASE is 2000;
+private int TY_ENUM_BASE is 3000;
+private int TY_ENUMREF_BASE is 4000;
 
 func int is_class_ptr_ty16(int ty) { return ty >= TY_CLASS_BASE && ty < TY_CLASSREF_BASE; }
 func int is_class_ref_ty16(int ty) { return ty >= TY_CLASSREF_BASE; }
+func int is_enum_ty16(int ty) { return ty >= TY_ENUM_BASE && ty < TY_ENUMREF_BASE; }
+func int is_enum_ref_ty16(int ty) { return ty >= TY_ENUMREF_BASE; }
 func int class_idx_from_ty16(int ty) {
     if (is_class_ptr_ty16(ty) == 1) { return ty - TY_CLASS_BASE; }
     if (is_class_ref_ty16(ty) == 1) { return ty - TY_CLASSREF_BASE; }
     return -1;
+}
+func int enum_idx_from_ty16(int ty) {
+    if (is_enum_ty16(ty) == 1) { return ty - TY_ENUM_BASE; }
+    if (is_enum_ref_ty16(ty) == 1) { return ty - TY_ENUMREF_BASE; }
+    return -1;
+}
+
+func int types_match16(int a, int b) {
+    if (a == b) { return 1; }
+    if (is_enum_ty16(a) == 1 && b == TY_INT) { return 1; }
+    if (is_enum_ty16(b) == 1 && a == TY_INT) { return 1; }
+    return 0;
 }
 
 func void cg16_error(string msg) {
@@ -61,6 +77,8 @@ class Codegen16 {
     int classes;  # VecInt (stride 3)
     int fields;   # VecInt (stride 4)
     int methods;  # VecInt (stride 4)
+    int enums;    # VecInt (stride 4)
+    int enum_vals; # VecInt (stride 4)
 
     int break_stack; # VecInt labels
     int cont_stack;  # VecInt labels
@@ -89,6 +107,8 @@ class Codegen16 {
         self->classes is 0;
         self->fields is 0;
         self->methods is 0;
+        self->enums is 0;
+        self->enum_vals is 0;
 
         self->cur_fn_class_idx is -1;
         self->cur_self_off is 0;
@@ -193,6 +213,8 @@ class Codegen16 {
     func int tok_is_string_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "string"); }
     func int tok_is_void_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "void"); }
     func int tok_is_class_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "class"); }
+    func int tok_is_struct_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "struct"); }
+    func int tok_is_enum_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "enum"); }
     func int tok_is_true(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "true"); }
     func int tok_is_false(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "false"); }
     func int tok_is_nullptr(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "nullptr"); }
@@ -200,6 +222,9 @@ class Codegen16 {
     func int tok_is_txtout_nl(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "txtout_nl"); }
     func int tok_is_out(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "out"); }
     func int tok_is_main(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "main"); }
+    func int tok_is_match_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "match"); }
+    func int tok_is_case_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "case"); }
+    func int tok_is_default_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "default"); }
 
     # ===== string table =====
     func int strtab_count(int* self) { return VecInt.count(self->strtab) / 2; }
@@ -312,6 +337,62 @@ class Codegen16 {
             if (ok == 1) { return i; }
         }
         return -1;
+    }
+
+    # Enum table stride=4: name_start,name_len,variant_base,variant_count
+    func int enums_count(int* self) {
+        if (self->enums == 0) { return 0; }
+        return VecInt.count(self->enums) / 4;
+    }
+    func int enums_get_name_start(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 0); }
+    func int enums_get_name_len(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 1); }
+    func int enums_get_variant_base(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 2); }
+    func int enums_get_variant_count(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 3); }
+
+    func int enum_find_by_name(int* self, int name_start, int name_len) {
+        n is Codegen16.enums_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (name_len != Codegen16.enums_get_name_len(self, i)) { continue; }
+            s is Codegen16.enums_get_name_start(self, i);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, s + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+
+    # Enum variant table stride=4: enum_idx,name_start,name_len,value
+    func int enum_variant_find_value(int* self, int enum_idx, int name_start, int name_len) {
+        if (self->enum_vals == 0) { return -1; }
+        n is VecInt.count(self->enum_vals) / 4;
+        for (int i is 0; i < n; i is i + 1) {
+            if (VecInt.get(self->enum_vals, i * 4 + 0) != enum_idx) { continue; }
+            if (VecInt.get(self->enum_vals, i * 4 + 2) != name_len) { continue; }
+            s is VecInt.get(self->enum_vals, i * 4 + 1);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, s + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return VecInt.get(self->enum_vals, i * 4 + 3); }
+        }
+        return -1;
+    }
+
+    func int type_ty_at(int* self, int pos) {
+        if (Codegen16.tok_is_int_kw(self, pos) == 1) { return TY_INT; }
+        if (Codegen16.tok_is_string_kw(self, pos) == 1) { return TY_STRING; }
+        if (Codegen16.tok_is_void_kw(self, pos) == 1) { return TY_VOID; }
+        if (VecToken.get_kind(self->toks, pos) == TK_IDENT) {
+            ns is VecToken.get_start(self->toks, pos);
+            nl is VecToken.get_len(self->toks, pos);
+            cidx is Codegen16.class_find_by_name(self, ns, nl);
+            if (cidx >= 0) { return TY_CLASS_BASE + cidx; }
+            eidx is Codegen16.enum_find_by_name(self, ns, nl);
+            if (eidx >= 0) { return TY_ENUM_BASE + eidx; }
+        }
+        return 0;
     }
 
     # Fields table stride=4: class_idx,name_start,name_len,offset_bytes
@@ -535,7 +616,7 @@ class Codegen16 {
             }
             if (is_minus == 1) { ty is TY_INT; }
             else {
-                if ((ty == TY_STRING && rty == TY_INT) || (ty == TY_INT && rty == TY_STRING)) { ty is TY_STRING; }
+                if (ty == TY_STRING || rty == TY_STRING) { cg16_error("string concatenation is not supported yet"); }
                 else if (ty == TY_INT && rty == TY_INT) { ty is TY_INT; }
                 else { cg16_error("add expects int"); }
             }
@@ -664,8 +745,25 @@ class Codegen16 {
             class_idx is Codegen16.class_find_by_name(self, base_name_start, base_name_len);
             base_ty is 0;
 
+            # Enum constant: EnumName.VariantName
+            if (VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+                Codegen16.tok_punct1(self, *pos + 1, 46) == 1 &&
+                Codegen16.enum_find_by_name(self, base_name_start, base_name_len) >= 0 &&
+                *pos + 2 < self->tok_count &&
+                VecToken.get_kind(self->toks, *pos + 2) == TK_IDENT) {
+                enum_idx is Codegen16.enum_find_by_name(self, base_name_start, base_name_len);
+                var_start is VecToken.get_start(self->toks, *pos + 2);
+                var_len is VecToken.get_len(self->toks, *pos + 2);
+                enum_val is Codegen16.enum_variant_find_value(self, enum_idx, var_start, var_len);
+                if (enum_val >= 0) {
+                    if (self->emit == 1) { Codegen16.emit_line_num(self, "    movw $", enum_val, ", %ax"); }
+                    *pos is *pos + 3;
+                    base_ty is TY_ENUM_BASE + enum_idx;
+                }
+            }
+
             # Class constructor: ClassName()
-            if (class_idx >= 0 && *pos + 1 < self->tok_count &&
+            if (base_ty == 0 && class_idx >= 0 && *pos + 1 < self->tok_count &&
                 VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
                 Codegen16.tok_punct1(self, *pos + 1, 40) == 1) {
                 *pos is *pos + 2; # ident + '('
@@ -679,7 +777,7 @@ class Codegen16 {
                 base_ty is TY_CLASS_BASE + class_idx;
             }
             # Plain function call: ident(...)
-            else if (*pos + 1 < self->tok_count &&
+            else if (base_ty == 0 && *pos + 1 < self->tok_count &&
                      VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
                      Codegen16.tok_punct1(self, *pos + 1, 40) == 1) {
                 is_txtin is Codegen16.tok_is_lit(self, *pos, "txtin");
@@ -742,7 +840,7 @@ class Codegen16 {
                 else { base_ty is Codegen16.fn_ret_ty_plain(self, name_start, name_len); }
             }
             # Variable or class reference
-            else {
+            else if (base_ty == 0) {
                 if (class_idx >= 0) {
                     *pos is *pos + 1;
                     base_ty is TY_CLASSREF_BASE + class_idx;
@@ -905,9 +1003,8 @@ class Codegen16 {
     }
 
     func void parse_bind_assign(int* self, int* pos, int end_ch, int require_semicolon) {
-        ty_decl is 0;
-        if (Codegen16.tok_is_int_kw(self, *pos) == 1) { ty_decl is TY_INT; *pos is *pos + 1; }
-        else if (Codegen16.tok_is_string_kw(self, *pos) == 1) { ty_decl is TY_STRING; *pos is *pos + 1; }
+        ty_decl is Codegen16.type_ty_at(self, *pos);
+        if (ty_decl != 0) { *pos is *pos + 1; }
 
         # pointer stars after explicit type
         while (ty_decl != 0 &&
@@ -932,7 +1029,9 @@ class Codegen16 {
 
         final_ty is expr_ty;
         if (ty_decl != 0) { final_ty is ty_decl; }
-        if (ty_decl != 0 && expr_ty != ty_decl) { cg16_error("type mismatch"); }
+        if (ty_decl != 0 && expr_ty != ty_decl) {
+            if (types_match16(ty_decl, expr_ty) == 0) { cg16_error("type mismatch"); }
+        }
 
         vidx is Codegen16.vars_find(self, ns, nl);
         if (vidx < 0) {
@@ -984,6 +1083,67 @@ class Codegen16 {
             if (self->emit == 1) {
                 Codegen16.emit_line(self, "    popw %bx");
                 Codegen16.emit_line(self, "    movw %ax, (%bx)");
+            }
+            return;
+        }
+
+        if (Codegen16.tok_is_match_kw(self, *pos) == 1) {
+            *pos is *pos + 1;
+            scrut_ty is Codegen16.parse_expr(self, pos);
+            if (Codegen16.tok_punct1(self, *pos, 123) == 0) { Codegen16.error_at(self, "expected '{' after match", *pos); }
+            *pos is *pos + 1;
+
+            if (self->emit == 1) { Codegen16.emit_line(self, "    pushw %ax"); }
+
+            end_lbl is Codegen16.new_label(self);
+            saw_default is 0;
+
+            while (*pos < end && Codegen16.tok_punct1(self, *pos, 125) == 0) {
+                if (Codegen16.tok_is_case_kw(self, *pos) == 1) {
+                    case_next_lbl is Codegen16.new_label(self);
+                    *pos is *pos + 1;
+                    case_ty is Codegen16.parse_expr(self, pos);
+                    if (types_match16(scrut_ty, case_ty) == 0) { cg16_error("match case type mismatch"); }
+                    bstart is 0;
+                    br is 0;
+                    Codegen16.parse_block(self, pos, &bstart, &br);
+                    if (self->emit == 1) {
+                        Codegen16.emit_line(self, "    popw %bx");
+                        Codegen16.emit_line(self, "    cmpw %ax, %bx");
+                        Codegen16.emit_line(self, "    pushw %bx");
+                        Codegen16.emit_str(self, "    jne .L");
+                        Codegen16.emit_dec(self, case_next_lbl);
+                        Codegen16.emit_nl(self);
+                    }
+                    Codegen16.parse_stmt_list(self, bstart, br);
+                    if (self->emit == 1) {
+                        Codegen16.emit_str(self, "    jmp .L");
+                        Codegen16.emit_dec(self, end_lbl);
+                        Codegen16.emit_nl(self);
+                        Codegen16.emit_label(self, case_next_lbl);
+                    }
+                    continue;
+                }
+                if (Codegen16.tok_is_default_kw(self, *pos) == 1) {
+                    if (saw_default == 1) { cg16_error("multiple default cases"); }
+                    saw_default is 1;
+                    *pos is *pos + 1;
+                    bstart is 0;
+                    br is 0;
+                    Codegen16.parse_block(self, pos, &bstart, &br);
+                    Codegen16.parse_stmt_list(self, bstart, br);
+                    continue;
+                }
+                cg16_error("expected case or default in match");
+            }
+            if (self->emit == 1) {
+                Codegen16.emit_line(self, "    addw $2, %sp");
+                Codegen16.emit_label(self, end_lbl);
+            }
+            if (*pos < end && Codegen16.tok_punct1(self, *pos, 125) == 1) {
+                *pos is *pos + 1;
+            } else {
+                Codegen16.error_at(self, "expected '}'", *pos);
             }
             return;
         }
@@ -1481,10 +1641,14 @@ class Codegen16 {
         globals is VecInt(); VecInt.init(globals);
         classes is VecInt(); VecInt.init(classes);
         fields is VecInt(); VecInt.init(fields);
+        enums is VecInt(); VecInt.init(enums);
+        enum_vals is VecInt(); VecInt.init(enum_vals);
         self->fns is funcs;
         self->globals is globals;
         self->classes is classes;
         self->fields is fields;
+        self->enums is enums;
+        self->enum_vals is enum_vals;
 
         func_locals is VecInt(); VecInt.init(func_locals);
         func_params is VecInt(); VecInt.init(func_params);
@@ -1493,10 +1657,12 @@ class Codegen16 {
         # Scan top-level for classes, methods, and funcs.
         pos is 0;
         while (pos < self->tok_count && VecToken.get_kind(self->toks, pos) != TK_EOF) {
-            if (Codegen16.tok_is_class_kw(self, pos) == 1) {
+            if (Codegen16.tok_is_class_kw(self, pos) == 1 || Codegen16.tok_is_struct_kw(self, pos) == 1) {
                 if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg16_error("expected class name"); }
                 cname_start is VecToken.get_start(self->toks, pos + 1);
                 cname_len is VecToken.get_len(self->toks, pos + 1);
+                allow_methods is 1;
+                if (Codegen16.tok_is_struct_kw(self, pos) == 1) { allow_methods is 0; }
 
                 p is pos + 2;
                 while (p < self->tok_count && !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen16.tok_punct1(self, p, 123) == 1)) { p is p + 1; }
@@ -1522,7 +1688,7 @@ class Codegen16 {
                 fieldc is 0;
                 i is body_lbrace + 1;
                 while (i < body_rbrace) {
-                    if (i + 2 < body_rbrace && Codegen16.tok_is_func(self, i) == 1) {
+                    if (allow_methods == 1 && i + 2 < body_rbrace && Codegen16.tok_is_func(self, i) == 1) {
                         if (VecToken.get_kind(self->toks, i + 1) != TK_IDENT) { cg16_error("expected return type"); }
                         if (VecToken.get_kind(self->toks, i + 2) != TK_IDENT) { cg16_error("expected method name"); }
                         ret_ty is TY_INT;
@@ -1610,6 +1776,57 @@ class Codegen16 {
                     i is i + 1;
                 }
                 VecInt.set(classes, class_idx * 3 + 2, fieldc * 2);
+                pos is body_rbrace + 1;
+                continue;
+            }
+
+            if (Codegen16.tok_is_enum_kw(self, pos) == 1) {
+                if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg16_error("expected enum name"); }
+                ename_start is VecToken.get_start(self->toks, pos + 1);
+                ename_len is VecToken.get_len(self->toks, pos + 1);
+
+                p is pos + 2;
+                while (p < self->tok_count && !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen16.tok_punct1(self, p, 123) == 1)) { p is p + 1; }
+                if (p >= self->tok_count) { cg16_error("expected '{' after enum"); }
+                body_lbrace is p;
+
+                depth is 1;
+                p is p + 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen16.tok_punct1(self, p, 123) == 1) { depth is depth + 1; }
+                        else if (Codegen16.tok_punct1(self, p, 125) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg16_error("unterminated enum body"); }
+                body_rbrace is p - 1;
+
+                enum_idx is VecInt.count(enums) / 4;
+                VecInt.push(enums, ename_start);
+                VecInt.push(enums, ename_len);
+                VecInt.push(enums, VecInt.count(enum_vals) / 4);
+                VecInt.push(enums, 0);
+
+                variantc is 0;
+                cur_val is 0;
+                i is body_lbrace + 1;
+                while (i < body_rbrace) {
+                    if (VecToken.get_kind(self->toks, i) == TK_IDENT) {
+                        vstart is VecToken.get_start(self->toks, i);
+                        vlen is VecToken.get_len(self->toks, i);
+                        VecInt.push(enum_vals, enum_idx);
+                        VecInt.push(enum_vals, vstart);
+                        VecInt.push(enum_vals, vlen);
+                        VecInt.push(enum_vals, cur_val);
+                        cur_val is cur_val + 1;
+                        variantc is variantc + 1;
+                        i is i + 1;
+                        continue;
+                    }
+                    i is i + 1;
+                }
+                VecInt.set(enums, enum_idx * 4 + 3, variantc);
                 pos is body_rbrace + 1;
                 continue;
             }
@@ -1982,11 +2199,19 @@ class Codegen16 {
         file_close(fd);
         self->fd is 0;
         VecInt.destroy(funcs); VecInt.destroy(globals); VecInt.destroy(classes); VecInt.destroy(fields);
+        VecInt.destroy(enums); VecInt.destroy(enum_vals);
         VecInt.destroy(func_locals); VecInt.destroy(func_params); VecInt.destroy(func_retlabels);
         free(funcs); free(globals); free(classes); free(fields);
+        free(enums); free(enum_vals);
         free(func_locals); free(func_params); free(func_retlabels);
         free(self->scratch);
         self->scratch is 0;
+        self->fns is 0;
+        self->globals is 0;
+        self->classes is 0;
+        self->fields is 0;
+        self->enums is 0;
+        self->enum_vals is 0;
     }
 }
 

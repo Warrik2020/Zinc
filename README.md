@@ -11,7 +11,9 @@ Zinc aims to provide a familiar, minimal syntax for systems programming with mod
 - C-like syntax and control flow
 - Static & Dynamic typing
 - Simple compiler pipeline
-- C++-style classes with automatic allocation
+- C++-style classes and structs with automatic allocation
+- Enums and `match`
+- Location-aware compiler diagnostics
 - And much more...
 
 Read the [wiki](https://github.com/Warrik2020/Zinc/wiki) for more info!
@@ -25,6 +27,8 @@ git clone https://github.com/Warrik2020/Zinc.git
 cd Zinc
 sudo make install
 ```
+
+installs to `/usr/local/bin/znc`
 
 ## Usage
 

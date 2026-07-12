@@ -21,6 +21,9 @@ private int TK_IDENT is 1;
 private int TK_NUMBER is 2;
 private int TK_STRING is 3;
 private int TK_PUNCT is 4;
+private int TK_MATCH is 31;
+private int TK_CASE is 29;
+private int TK_DEFAULT is 30;
 
 private int TY_INT is 1;
 private int TY_STRING is 2;
@@ -29,18 +32,95 @@ private int TY_STR_ARR is 4; # char* argv[] style
 
 private int TY_CLASS_BASE is 1000;   # TY_CLASS_BASE + class_idx
 private int TY_CLASSREF_BASE is 2000; # TY_CLASSREF_BASE + class_idx (for `Class.method()` calls)
+private int TY_ENUM_BASE is 3000;     # TY_ENUM_BASE + enum_idx
+private int TY_ENUMREF_BASE is 4000;  # TY_ENUMREF_BASE + enum_idx
 
 func int is_class_ptr_ty(int ty) { return ty >= TY_CLASS_BASE && ty < TY_CLASSREF_BASE; }
 func int is_class_ref_ty(int ty) { return ty >= TY_CLASSREF_BASE; }
+func int is_enum_ty(int ty) { return ty >= TY_ENUM_BASE && ty < TY_ENUMREF_BASE; }
+func int is_enum_ref_ty(int ty) { return ty >= TY_ENUMREF_BASE; }
 func int class_idx_from_ty(int ty) {
     if (is_class_ptr_ty(ty) == 1) { return ty - TY_CLASS_BASE; }
     if (is_class_ref_ty(ty) == 1) { return ty - TY_CLASSREF_BASE; }
     return -1;
 }
+func int enum_idx_from_ty(int ty) {
+    if (is_enum_ty(ty) == 1) { return ty - TY_ENUM_BASE; }
+    if (is_enum_ref_ty(ty) == 1) { return ty - TY_ENUMREF_BASE; }
+    return -1;
+}
+
+func int types_match(int a, int b) {
+    if (a == b) { return 1; }
+    if (is_enum_ty(a) == 1 && b == TY_INT) { return 1; }
+    if (is_enum_ty(b) == 1 && a == TY_INT) { return 1; }
+    return 0;
+}
 
 func void cg_error(string msg) {
     txtout("codegen error: ", msg);
     out(1);
+}
+
+func int cg_line_start_at(string src, int byte_pos) {
+    i is byte_pos;
+    if (i < 0) { i is 0; }
+    n is len(src);
+    if (i > n) { i is n; }
+    while (i > 0 && src[i - 1] != 10) { i is i - 1; }
+    return i;
+}
+
+func int cg_line_end_at(string src, int byte_pos) {
+    i is byte_pos;
+    if (i < 0) { i is 0; }
+    n is len(src);
+    while (i < n && src[i] != 10) { i is i + 1; }
+    return i;
+}
+
+func void cg_emit_spaces(int count) {
+    if (count <= 0) { return; }
+    string pad is substr_copy("                                                                                                                                                                                                                                                                ", 0, count);
+    txtout(pad);
+    free(pad);
+}
+
+func string cg_location_string(string src, int line, int col, int byte_pos) {
+    scan_start is cg_line_start_at(src, byte_pos);
+    scan_line is line;
+    while (1) {
+        scan_end is cg_line_end_at(src, scan_start);
+        if (scan_end - scan_start >= 10) {
+            prefix is substr(src, scan_start, 10);
+            if (__zinc_rt_strcmp(prefix, "#@zn_file ") == 0) {
+                path is substr(src, scan_start + 10, scan_end - (scan_start + 10));
+                file_line is line - scan_line - 1;
+                s1 is str_concat2(path, ":");
+                s2 is str_concat2(s1, int_as_str(file_line));
+                s3 is str_concat2(s2, ":");
+                s4 is str_concat2(s3, int_as_str(col));
+                s5 is str_concat2(s4, ": ");
+                free(prefix);
+                free(path);
+                free(s1);
+                free(s2);
+                free(s3);
+                free(s4);
+                return s5;
+            }
+            free(prefix);
+        }
+        if (scan_start == 0) { break; }
+        scan_start is cg_line_start_at(src, scan_start - 1);
+        scan_line is scan_line - 1;
+    }
+    s1 is str_concat2(int_as_str(line), ":");
+    s2 is str_concat2(s1, int_as_str(col));
+    s3 is str_concat2(s2, ": ");
+    free(s1);
+    free(s2);
+    return s3;
 }
 
 class Codegen {
@@ -58,6 +138,8 @@ class Codegen {
     int classes; # VecInt: class records (set during compile)
     int fields;  # VecInt: field records (set during compile)
     int methods; # VecInt: method records (set during compile)
+    int enums;   # VecInt: enum records
+    int enum_vals; # VecInt: enum variant records
     int debug;
     int scratch;
     int label_counter;
@@ -69,6 +151,10 @@ class Codegen {
     int cur_fn_name_start;
     int cur_fn_name_len;
     int cur_fn_ret_ty;
+    int cur_assign_name_start;
+    int cur_assign_name_len;
+    int cur_assign_check_self;
+    int cur_assign_self_ref;
     int break_stack;
     int cont_stack;
 
@@ -85,6 +171,10 @@ class Codegen {
         self->globals is 0;
         self->classes is 0;
         self->fields is 0;
+        self->enums is 0;
+        self->enum_vals is 0;
+        self->enums is 0;
+        self->enum_vals is 0;
         self->methods is 0;
         self->debug is debug;
         self->scratch is rt_malloc(8);
@@ -98,6 +188,10 @@ class Codegen {
         self->cur_fn_name_start is 0;
         self->cur_fn_name_len is 0;
         self->cur_fn_ret_ty is TY_INT;
+        self->cur_assign_name_start is -1;
+        self->cur_assign_name_len is 0;
+        self->cur_assign_check_self is 0;
+        self->cur_assign_self_ref is 0;
 
         self->vars is VecInt();
         VecInt.init(self->vars);
@@ -146,7 +240,46 @@ class Codegen {
             line is VecToken.get_line(self->toks, pos);
             col is VecToken.get_col(self->toks, pos);
         }
-        txtout("codegen error at ", line, ":", col, ": ", msg);
+        if (pos >= 0 && pos < self->tok_count) {
+            byte_pos is VecToken.get_start(self->toks, pos);
+            scan_start is cg_line_start_at(self->src, byte_pos);
+            scan_line is line;
+            found is 0;
+            while (1) {
+                scan_end is cg_line_end_at(self->src, scan_start);
+                if (scan_end - scan_start >= 10) {
+                    prefix is substr(self->src, scan_start, 10);
+                    if (__zinc_rt_strcmp(prefix, "#@zn_file ") == 0) {
+                        path is substr(self->src, scan_start + 10, scan_end - (scan_start + 10));
+                        file_line is line - scan_line - 1;
+                        txtout("codegen error at ", path, ":", file_line, ":", col, ": ", msg);
+                        free(path);
+                        free(prefix);
+                        found is 1;
+                        break;
+                    }
+                    free(prefix);
+                }
+                if (scan_start == 0) { break; }
+                scan_start is cg_line_start_at(self->src, scan_start - 1);
+                scan_line is scan_line - 1;
+            }
+            if (found == 0) {
+                txtout("codegen error at ", line, ":", col, ": ", msg);
+            }
+            start is cg_line_start_at(self->src, byte_pos);
+            end is cg_line_end_at(self->src, byte_pos);
+            snippet is substr(self->src, start, end - start);
+            pad is substr_copy("                                                                                                                                                                                                                                                                ", 0, col - 1);
+            marker is str_concat2(pad, "^");
+            txtout("    ", snippet);
+            txtout(marker);
+            free(snippet);
+            free(pad);
+            free(marker);
+        } else {
+            txtout("codegen error at ", line, ":", col, ": ", msg);
+        }
         out(1);
     }
 
@@ -393,6 +526,62 @@ class Codegen {
                Codegen.byte_at(self, s + 3) == 115 &&
                Codegen.byte_at(self, s + 4) == 115;
     }
+    func int tok_is_struct_kw(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 6) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 115 &&
+               Codegen.byte_at(self, s + 1) == 116 &&
+               Codegen.byte_at(self, s + 2) == 114 &&
+               Codegen.byte_at(self, s + 3) == 117 &&
+               Codegen.byte_at(self, s + 4) == 99 &&
+               Codegen.byte_at(self, s + 5) == 116;
+    }
+    func int tok_is_enum_kw(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 4) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 101 &&
+               Codegen.byte_at(self, s + 1) == 110 &&
+               Codegen.byte_at(self, s + 2) == 117 &&
+               Codegen.byte_at(self, s + 3) == 109;
+    }
+    func int tok_is_match_kw(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 5) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 109 &&
+               Codegen.byte_at(self, s + 1) == 97 &&
+               Codegen.byte_at(self, s + 2) == 116 &&
+               Codegen.byte_at(self, s + 3) == 99 &&
+               Codegen.byte_at(self, s + 4) == 104;
+    }
+    func int tok_is_case_kw(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 4) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 99 &&
+               Codegen.byte_at(self, s + 1) == 97 &&
+               Codegen.byte_at(self, s + 2) == 115 &&
+               Codegen.byte_at(self, s + 3) == 101;
+    }
+    func int tok_is_default_kw(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 7) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 100 &&
+               Codegen.byte_at(self, s + 1) == 101 &&
+               Codegen.byte_at(self, s + 2) == 102 &&
+               Codegen.byte_at(self, s + 3) == 97 &&
+               Codegen.byte_at(self, s + 4) == 117 &&
+               Codegen.byte_at(self, s + 5) == 108 &&
+               Codegen.byte_at(self, s + 6) == 116;
+    }
     func int tok_is_break(int* self, int pos) {
         if (pos < 0 || pos >= self->tok_count) { return 0; }
         if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
@@ -533,6 +722,14 @@ class Codegen {
         return -1;
     }
 
+    func int name_matches(int* self, int a_start, int a_len, int b_start, int b_len) {
+        if (a_len != b_len) { return 0; }
+        for (int i is 0; i < a_len; i is i + 1) {
+            if (Codegen.byte_at(self, a_start + i) != Codegen.byte_at(self, b_start + i)) { return 0; }
+        }
+        return 1;
+    }
+
     func void vars_add(int* self, int name_start, int name_len, int ty, int off, int mutable) {
         VecInt.push(self->vars, name_start);
         VecInt.push(self->vars, name_len);
@@ -610,6 +807,66 @@ class Codegen {
             if (ok == 1) { return i; }
         }
         return -1;
+    }
+
+    # Enum table record stride = 4:
+    # 0 name_start, 1 name_len, 2 variant_base, 3 variant_count
+    func int enums_count(int* self) {
+        if (self->enums == 0) { return 0; }
+        return VecInt.count(self->enums) / 4;
+    }
+    func int enums_get_name_start(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 0); }
+    func int enums_get_name_len(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 1); }
+    func int enums_get_variant_base(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 2); }
+    func int enums_get_variant_count(int* self, int idx) { return VecInt.get(self->enums, idx * 4 + 3); }
+
+    func int enum_find_by_name(int* self, int name_start, int name_len) {
+        n is Codegen.enums_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (name_len != Codegen.enums_get_name_len(self, i)) { continue; }
+            s is Codegen.enums_get_name_start(self, i);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen.byte_at(self, s + j) != Codegen.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+
+    # Enum variant table record stride = 4:
+    # 0 enum_idx, 1 name_start, 2 name_len, 3 value
+    func int enum_variant_find_value(int* self, int enum_idx, int name_start, int name_len) {
+        if (self->enum_vals == 0) { return -1; }
+        n is VecInt.count(self->enum_vals) / 4;
+        for (int i is 0; i < n; i is i + 1) {
+            if (VecInt.get(self->enum_vals, i * 4 + 0) != enum_idx) { continue; }
+            if (VecInt.get(self->enum_vals, i * 4 + 2) != name_len) { continue; }
+            s is VecInt.get(self->enum_vals, i * 4 + 1);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen.byte_at(self, s + j) != Codegen.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return VecInt.get(self->enum_vals, i * 4 + 3); }
+        }
+        return -1;
+    }
+
+    func int type_ty_at(int* self, int pos) {
+        if (Codegen.tok_is_int(self, pos) == 1) { return TY_INT; }
+        if (Codegen.tok_is_float_kw(self, pos) == 1) { return TY_INT; }
+        if (Codegen.tok_is_bool_kw(self, pos) == 1) { return TY_INT; }
+        if (Codegen.tok_is_string_kw(self, pos) == 1) { return TY_STRING; }
+        if (Codegen.tok_is_void_kw(self, pos) == 1) { return TY_VOID; }
+        if (VecToken.get_kind(self->toks, pos) == TK_IDENT) {
+            ns is VecToken.get_start(self->toks, pos);
+            nl is VecToken.get_len(self->toks, pos);
+            cidx is Codegen.class_find_by_name(self, ns, nl);
+            if (cidx >= 0) { return TY_CLASS_BASE + cidx; }
+            eidx is Codegen.enum_find_by_name(self, ns, nl);
+            if (eidx >= 0) { return TY_ENUM_BASE + eidx; }
+        }
+        return 0;
     }
 
     # Field table record stride = 4:
@@ -897,9 +1154,15 @@ class Codegen {
             if (is_minus == 1) {
                 ty is TY_INT;
             } else {
-                if ((ty == TY_STRING && rty == TY_INT) || (ty == TY_INT && rty == TY_STRING)) { ty is TY_STRING; }
-                else if (ty == TY_INT && rty == TY_INT) { ty is TY_INT; }
-                else { Codegen.error_at(self, "add expects int", op_pos); }
+                if (ty == TY_INT && rty == TY_INT) { ty is TY_INT; }
+                else if ((ty == TY_STRING && rty == TY_INT) || (ty == TY_INT && rty == TY_STRING)) {
+                    ty is TY_STRING;
+                }
+                else if (ty == TY_STRING || rty == TY_STRING) {
+                    Codegen.error_at(self, "string concatenation is not supported yet", op_pos);
+                } else {
+                    Codegen.error_at(self, "add expects int", op_pos);
+                }
             }
         }
         return ty;
@@ -954,7 +1217,7 @@ class Codegen {
             ns is VecToken.get_start(self->toks, *pos);
             nl is VecToken.get_len(self->toks, *pos);
             vidx is Codegen.vars_find(self, ns, nl);
-            if (vidx < 0) { cg_error("unknown variable"); }
+            if (vidx < 0) { Codegen.error_at(self, "unknown variable", *pos); }
             if (self->emit == 1) {
                 off is Codegen.vars_get_off(self, vidx);
                 if (self->bitness == 32) {
@@ -1077,6 +1340,24 @@ class Codegen {
                 }
                 base_ty is TY_CLASS_BASE + class_idx;
             }
+            else if (VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+                     Codegen.tok_punct1(self, *pos + 1, 46) == 1 &&
+                     Codegen.enum_find_by_name(self, base_name_start, base_name_len) >= 0 &&
+                     *pos + 2 < self->tok_count &&
+                     VecToken.get_kind(self->toks, *pos + 2) == TK_IDENT) {
+                enum_idx is Codegen.enum_find_by_name(self, base_name_start, base_name_len);
+                var_start is VecToken.get_start(self->toks, *pos + 2);
+                var_len is VecToken.get_len(self->toks, *pos + 2);
+                enum_val is Codegen.enum_variant_find_value(self, enum_idx, var_start, var_len);
+                if (enum_val >= 0) {
+                    if (self->emit == 1) {
+                        if (self->bitness == 32) { Codegen.emit_line_num(self, "    movl $", enum_val, ", %eax"); }
+                        else { Codegen.emit_line_num(self, "    movq $", enum_val, ", %rax"); }
+                    }
+                    *pos is *pos + 3;
+                    base_ty is TY_ENUM_BASE + enum_idx;
+                }
+            }
             # Plain function call: ident(...)
 	            else if (*pos + 1 < self->tok_count &&
 	                     VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
@@ -1175,12 +1456,12 @@ class Codegen {
                 } else {
                     ns is base_name_start;
                     nl is base_name_len;
-                    vidx is Codegen.vars_find(self, ns, nl);
-                    if (vidx < 0) {
-                        gidx is Codegen.globals_find(self, ns, nl);
-                        if (gidx < 0) { cg_error("unknown variable"); }
-                        gty is Codegen.globals_get_type(self, gidx);
-                        gval is Codegen.globals_get_val(self, gidx);
+            vidx is Codegen.vars_find(self, ns, nl);
+            if (vidx < 0) {
+                gidx is Codegen.globals_find(self, ns, nl);
+                if (gidx < 0) { Codegen.error_at(self, "unknown variable", *pos); }
+                gty is Codegen.globals_get_type(self, gidx);
+                gval is Codegen.globals_get_val(self, gidx);
 	                        if (self->emit == 1) {
 	                            if (gty == TY_STRING) {
 	                                if (self->bitness == 32) {
@@ -1201,6 +1482,10 @@ class Codegen {
                         base_ty is gty;
                     } else {
 	                        base_ty is Codegen.vars_get_type(self, vidx);
+	                        if (self->cur_assign_check_self == 1 &&
+	                            Codegen.name_matches(self, ns, nl, self->cur_assign_name_start, self->cur_assign_name_len) == 1) {
+	                            self->cur_assign_self_ref is 1;
+	                        }
 	                        if (self->emit == 1) {
 	                            off is Codegen.vars_get_off(self, vidx);
 	                            if (self->bitness == 32) {
@@ -1739,10 +2024,8 @@ class Codegen {
 
     func void parse_bind_assign(int* self, int* pos, int end_ch, int require_semicolon) {
         ty_decl is 0;
-        if (Codegen.tok_is_int(self, *pos) == 1) { ty_decl is TY_INT; *pos is *pos + 1; }
-        else if (Codegen.tok_is_float_kw(self, *pos) == 1) { ty_decl is TY_INT; *pos is *pos + 1; }
-        else if (Codegen.tok_is_bool_kw(self, *pos) == 1) { ty_decl is TY_INT; *pos is *pos + 1; }
-        else if (Codegen.tok_is_string_kw(self, *pos) == 1) { ty_decl is TY_STRING; *pos is *pos + 1; }
+        ty_decl is Codegen.type_ty_at(self, *pos);
+        if (ty_decl != 0) { *pos is *pos + 1; }
 
         # pointer stars after explicit type (e.g. `int* p is &x;`)
         while (ty_decl != 0 &&
@@ -1751,6 +2034,7 @@ class Codegen {
             *pos is *pos + 1;
         }
 
+        name_pos is *pos;
         if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg_error("expected variable name"); }
         ns is VecToken.get_start(self->toks, *pos);
         nl is VecToken.get_len(self->toks, *pos);
@@ -1758,6 +2042,15 @@ class Codegen {
 
         if (Codegen.tok_is_is(self, *pos) == 0) { cg_error("expected 'is'"); }
         *pos is *pos + 1;
+
+        prev_assign_start is self->cur_assign_name_start;
+        prev_assign_len is self->cur_assign_name_len;
+        prev_assign_check is self->cur_assign_check_self;
+        prev_assign_ref is self->cur_assign_self_ref;
+        self->cur_assign_name_start is ns;
+        self->cur_assign_name_len is nl;
+        self->cur_assign_check_self is 1;
+        self->cur_assign_self_ref is 0;
 
         expr_ty is Codegen.parse_expr(self, pos);
 
@@ -1782,14 +2075,20 @@ class Codegen {
         } else {
             if (Codegen.vars_get_type(self, vidx) != final_ty) {
                 if (Codegen.vars_get_mutable(self, vidx) == 1) {
-                    # Inferred locals are allowed to change type (matches the C backend's
-                    # "dynamic" locals, but implemented here as compile-time type changes).
+                    if (self->cur_assign_self_ref == 1) {
+                        Codegen.error_at(self, "self-referential polymorphic rebind is not supported yet", name_pos);
+                    }
                     VecInt.set(self->vars, vidx * 5 + 2, final_ty);
                 } else {
                     cg_error("rebind type mismatch");
                 }
             }
         }
+
+        self->cur_assign_name_start is prev_assign_start;
+        self->cur_assign_name_len is prev_assign_len;
+        self->cur_assign_check_self is prev_assign_check;
+        self->cur_assign_self_ref is prev_assign_ref;
 
 	        if (self->emit == 1) {
 	            off is Codegen.vars_get_off(self, vidx);
@@ -1818,7 +2117,7 @@ class Codegen {
             ns is VecToken.get_start(self->toks, *pos);
             nl is VecToken.get_len(self->toks, *pos);
             vidx is Codegen.vars_find(self, ns, nl);
-            if (vidx < 0) { cg_error("unknown variable"); }
+            if (vidx < 0) { Codegen.error_at(self, "unknown variable", *pos); }
 
 	            if (self->emit == 1) {
 	                off is Codegen.vars_get_off(self, vidx);
@@ -1846,6 +2145,76 @@ class Codegen {
 	                Codegen.emit_line_bitness(self, "    popq %r10", "    popl %ebx");
 	                Codegen.emit_line_bitness(self, "    movq %rax, (%r10)", "    movl %eax, (%ebx)");
 	        }
+            return;
+        }
+
+        if (Codegen.tok_is_match_kw(self, *pos) == 1) {
+            *pos is *pos + 1;
+            scrut_ty is Codegen.parse_expr(self, pos);
+            if (Codegen.tok_punct1(self, *pos, 123) == 0) { Codegen.error_at(self, "expected '{' after match", *pos); }
+            *pos is *pos + 1;
+
+            if (self->emit == 1) {
+                Codegen.emit_line_bitness(self, "    pushq %rax", "    pushl %eax");
+            }
+
+            end_lbl is Codegen.new_label(self);
+            saw_default is 0;
+
+            while (*pos < end && Codegen.tok_punct1(self, *pos, 125) == 0) {
+                if (Codegen.tok_is_case_kw(self, *pos) == 1) {
+                    case_next_lbl is Codegen.new_label(self);
+                    *pos is *pos + 1;
+                    case_ty is Codegen.parse_expr(self, pos);
+                    if (types_match(scrut_ty, case_ty) == 0) { cg_error("match case type mismatch"); }
+                    bstart is 0;
+                    br is 0;
+                    Codegen.parse_block(self, pos, &bstart, &br);
+                    if (self->emit == 1) {
+                        if (self->bitness == 32) {
+                            Codegen.emit_line(self, "    movl (%esp), %ebx");
+                            Codegen.emit_line(self, "    cmpl %eax, %ebx");
+                            Codegen.emit_str(self, "    jne .L");
+                            Codegen.emit_dec(self, case_next_lbl);
+                            Codegen.emit_nl(self);
+                        } else {
+                            Codegen.emit_line(self, "    movq (%rsp), %r10");
+                            Codegen.emit_line(self, "    cmpq %rax, %r10");
+                            Codegen.emit_str(self, "    jne .L");
+                            Codegen.emit_dec(self, case_next_lbl);
+                            Codegen.emit_nl(self);
+                        }
+                    }
+                    Codegen.parse_stmt_list(self, bstart, br);
+                    if (self->emit == 1) {
+                        Codegen.emit_str(self, "    jmp .L");
+                        Codegen.emit_dec(self, end_lbl);
+                        Codegen.emit_nl(self);
+                        Codegen.emit_label(self, case_next_lbl);
+                    }
+                    continue;
+                }
+                if (Codegen.tok_is_default_kw(self, *pos) == 1) {
+                    if (saw_default == 1) { cg_error("multiple default cases"); }
+                    saw_default is 1;
+                    *pos is *pos + 1;
+                    bstart is 0;
+                    br is 0;
+                    Codegen.parse_block(self, pos, &bstart, &br);
+                    Codegen.parse_stmt_list(self, bstart, br);
+                    continue;
+                }
+                cg_error("expected case or default in match");
+            }
+            if (self->emit == 1) {
+                Codegen.emit_line_bitness(self, "    addq $8, %rsp", "    addl $4, %esp");
+                Codegen.emit_label(self, end_lbl);
+            }
+            if (*pos < end && Codegen.tok_punct1(self, *pos, 125) == 1) {
+                *pos is *pos + 1;
+            } else {
+                Codegen.error_at(self, "expected '}'", *pos);
+            }
             return;
         }
 
@@ -2247,10 +2616,16 @@ class Codegen {
         VecInt.init(classes);
         fields is VecInt();
         VecInt.init(fields);
+        enums is VecInt();
+        VecInt.init(enums);
+        enum_vals is VecInt();
+        VecInt.init(enum_vals);
         self->fns is funcs;
         self->globals is globals;
         self->classes is classes;
         self->fields is fields;
+        self->enums is enums;
+        self->enum_vals is enum_vals;
         func_locals is VecInt();
         VecInt.init(func_locals);
         func_params is VecInt();
@@ -2261,12 +2636,13 @@ class Codegen {
         pos is 0;
         while (pos < self->tok_count && VecToken.get_kind(self->toks, pos) != TK_EOF) {
             # Class declaration: class Name { ... }
-            if (Codegen.tok_is_class_kw(self, pos) == 1) {
+            if (Codegen.tok_is_class_kw(self, pos) == 1 || Codegen.tok_is_struct_kw(self, pos) == 1) {
                 if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg_error("expected class name"); }
                 cname_start is VecToken.get_start(self->toks, pos + 1);
                 cname_len is VecToken.get_len(self->toks, pos + 1);
+                allow_methods is 1;
+                if (Codegen.tok_is_struct_kw(self, pos) == 1) { allow_methods is 0; }
 
-                # Find '{'
                 p is pos + 2;
                 while (p < self->tok_count &&
                        !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen.tok_punct1(self, p, 123) == 1)) {
@@ -2275,7 +2651,6 @@ class Codegen {
                 if (p >= self->tok_count) { cg_error("expected '{' after class"); }
                 body_lbrace is p;
 
-                # Find matching '}'
                 depth is 1;
                 p is p + 1;
                 while (p < self->tok_count && depth > 0) {
@@ -2291,13 +2666,12 @@ class Codegen {
                 class_idx is VecInt.count(classes) / 3;
                 VecInt.push(classes, cname_start);
                 VecInt.push(classes, cname_len);
-                VecInt.push(classes, 0); # patched after scanning fields
+                VecInt.push(classes, 0);
 
                 fieldc is 0;
                 i is body_lbrace + 1;
                 while (i < body_rbrace) {
-                    # Method
-                    if (i + 2 < body_rbrace && Codegen.tok_is_func(self, i) == 1) {
+                    if (allow_methods == 1 && i + 2 < body_rbrace && Codegen.tok_is_func(self, i) == 1) {
                         if (VecToken.get_kind(self->toks, i + 1) != TK_IDENT) { cg_error("expected return type"); }
                         if (VecToken.get_kind(self->toks, i + 2) != TK_IDENT) { cg_error("expected method name"); }
 
@@ -2345,7 +2719,6 @@ class Codegen {
                         if (depth3 != 0) { cg_error("unterminated method body"); }
                         body_end is mp - 1;
 
-                        # Instance method heuristic: first param has at least one '*'
                         is_instance is 0;
                         if (param_start < param_end && VecToken.get_kind(self->toks, param_start) == TK_IDENT) {
                             pp is param_start + 1;
@@ -2371,7 +2744,6 @@ class Codegen {
                         continue;
                     }
 
-                    # Field: <type> '*'* <name> ;
                     if (VecToken.get_kind(self->toks, i) == TK_IDENT) {
                         j is i + 1;
                         while (j < body_rbrace &&
@@ -2383,11 +2755,11 @@ class Codegen {
                             Codegen.tok_punct1(self, j + 1, 59) == 1) {
                             fname_start is VecToken.get_start(self->toks, j);
                             fname_len is VecToken.get_len(self->toks, j);
-	                        VecInt.push(fields, class_idx);
-	                        VecInt.push(fields, fname_start);
-	                        VecInt.push(fields, fname_len);
-	                        VecInt.push(fields, fieldc * self->word_size);
-	                        fieldc is fieldc + 1;
+                            VecInt.push(fields, class_idx);
+                            VecInt.push(fields, fname_start);
+                            VecInt.push(fields, fname_len);
+                            VecInt.push(fields, fieldc * self->word_size);
+                            fieldc is fieldc + 1;
                             i is j + 2;
                             continue;
                         }
@@ -2396,7 +2768,65 @@ class Codegen {
                     i is i + 1;
                 }
 
-	                VecInt.set(classes, class_idx * 3 + 2, fieldc * self->word_size);
+                VecInt.set(classes, class_idx * 3 + 2, fieldc * self->word_size);
+                pos is body_rbrace + 1;
+                continue;
+            }
+
+            # Enum declaration: enum Name { A; B; }
+            if (Codegen.tok_is_enum_kw(self, pos) == 1) {
+                if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg_error("expected enum name"); }
+                ename_start is VecToken.get_start(self->toks, pos + 1);
+                ename_len is VecToken.get_len(self->toks, pos + 1);
+
+                p is pos + 2;
+                while (p < self->tok_count &&
+                       !(VecToken.get_kind(self->toks, p) == TK_PUNCT && Codegen.tok_punct1(self, p, 123) == 1)) {
+                    p is p + 1;
+                }
+                if (p >= self->tok_count) { cg_error("expected '{' after enum"); }
+                body_lbrace is p;
+
+                depth is 1;
+                p is p + 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen.tok_punct1(self, p, 123) == 1) { depth is depth + 1; }
+                        else if (Codegen.tok_punct1(self, p, 125) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg_error("unterminated enum body"); }
+                body_rbrace is p - 1;
+
+                enum_idx is VecInt.count(enums) / 4;
+                VecInt.push(enums, ename_start);
+                VecInt.push(enums, ename_len);
+                VecInt.push(enums, VecInt.count(enum_vals) / 4);
+
+                variantc is 0;
+                cur_val is 0;
+                i is body_lbrace + 1;
+                while (i < body_rbrace) {
+                    if (VecToken.get_kind(self->toks, i) == TK_IDENT) {
+                        vstart is VecToken.get_start(self->toks, i);
+                        vlen is VecToken.get_len(self->toks, i);
+                        VecInt.push(enum_vals, enum_idx);
+                        VecInt.push(enum_vals, vstart);
+                        VecInt.push(enum_vals, vlen);
+                        VecInt.push(enum_vals, cur_val);
+                        cur_val is cur_val + 1;
+                        variantc is variantc + 1;
+                        i is i + 1;
+                        if (i < body_rbrace && VecToken.get_kind(self->toks, i) == TK_PUNCT &&
+                            (Codegen.tok_punct1(self, i, 59) == 1 || Codegen.tok_punct1(self, i, 44) == 1)) {
+                            i is i + 1;
+                        }
+                        continue;
+                    }
+                    i is i + 1;
+                }
+                VecInt.push(enums, variantc);
                 pos is body_rbrace + 1;
                 continue;
             }
@@ -2817,6 +3247,10 @@ class Codegen {
         free(classes);
         VecInt.destroy(fields);
         free(fields);
+        VecInt.destroy(enums);
+        free(enums);
+        VecInt.destroy(enum_vals);
+        free(enum_vals);
 
         VecInt.destroy(func_locals);
         free(func_locals);
