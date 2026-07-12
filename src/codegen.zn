@@ -30,6 +30,7 @@ private int TY_INT is 1;
 private int TY_STRING is 2;
 private int TY_VOID is 3;
 private int TY_STR_ARR is 4; # char* argv[] style
+private int TY_ARRAY is 5;   # int[] style (variable holds a pointer to a heap array)
 
 private int TY_CLASS_BASE is 1000;   # TY_CLASS_BASE + class_idx
 private int TY_CLASSREF_BASE is 2000; # TY_CLASSREF_BASE + class_idx (for `Class.method()` calls)
@@ -1700,6 +1701,110 @@ class Codegen {
 
             return base_ty;
         }
+        # Array literal: [size]{data}  (the {data} part is optional)
+        if (k == TK_PUNCT && Codegen.tok_punct1(self, *pos, 91) == 1) {
+            *pos is *pos + 1; # '['
+            size_ty is Codegen.parse_expr(self, pos);
+            if (size_ty != TY_INT) { cg_error("array size expects int"); }
+            if (VecToken.get_kind(self->toks, *pos) != TK_PUNCT || Codegen.tok_punct1(self, *pos, 93) == 0) { Codegen.error_at(self, "expected ']'", *pos); }
+            *pos is *pos + 1; # ']'
+
+            # Optional initializer block { e0, e1, ... }
+            has_data is 0;
+            if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen.tok_punct1(self, *pos, 123) == 1) {
+                has_data is 1;
+                *pos is *pos + 1; # '{'
+            }
+
+            # Count elements (compile-time constant) so we can allocate max(size, count).
+            elem_count is 0;
+            if (has_data == 1) {
+                save_emit is self->emit;
+                self->emit is 0;
+                cpos is *pos;
+                while (1) {
+                    if (VecToken.get_kind(self->toks, cpos) == TK_PUNCT && Codegen.tok_punct1(self, cpos, 125) == 1) { break; }
+                    Codegen.parse_expr(self, &cpos);
+                    elem_count is elem_count + 1;
+                    if (VecToken.get_kind(self->toks, cpos) == TK_PUNCT && Codegen.tok_punct1(self, cpos, 44) == 1) { cpos is cpos + 1; continue; }
+                    break;
+                }
+                self->emit is save_emit;
+            }
+
+            if (self->emit == 1) {
+                # rax = size; allocate max(size, elem_count) * word_size bytes.
+                # cmov is register-to-register only (no immediate operands).
+                if (self->bitness == 32) {
+                    if (elem_count > 0) {
+                        Codegen.emit_line(self, "    movl %eax, %edi");
+                        Codegen.emit_line_num(self, "    movl $", elem_count, ", %ecx");
+                        Codegen.emit_line(self, "    cmpl %ecx, %eax");
+                        Codegen.emit_line(self, "    cmovl %ecx, %edi");
+                        Codegen.emit_line(self, "    imull $4, %edi");
+                    } else {
+                        Codegen.emit_line(self, "    imull $4, %eax");
+                        Codegen.emit_line(self, "    movl %eax, %edi");
+                    }
+                    Codegen.emit_call_prep(self, 1);
+                    Codegen.emit_line(self, "    pushl %edi");
+                    Codegen.emit_line(self, "    call malloc@PLT");
+                    Codegen.emit_call_cleanup(self, 1);
+                    Codegen.emit_line(self, "    pushl %eax"); # save base
+                } else {
+                    if (elem_count > 0) {
+                        Codegen.emit_line(self, "    movq %rax, %rdi");
+                        Codegen.emit_line_num(self, "    movq $", elem_count, ", %rdx");
+                        Codegen.emit_line(self, "    cmpq %rdx, %rax");
+                        Codegen.emit_line(self, "    cmovlq %rdx, %rdi");
+                        Codegen.emit_line(self, "    imulq $8, %rdi");
+                    } else {
+                        Codegen.emit_line(self, "    imulq $8, %rax");
+                        Codegen.emit_line(self, "    movq %rax, %rdi");
+                    }
+                    Codegen.emit_line(self, "    call malloc@PLT");
+                    Codegen.emit_line(self, "    pushq %rax"); # save base
+                }
+            }
+
+            elem_idx is 0;
+            if (has_data == 1) {
+                while (1) {
+                    ety is Codegen.parse_expr(self, pos);
+                    if (ety != TY_INT) { cg_error("array element expects int"); }
+                    if (self->emit == 1) {
+                        if (self->bitness == 32) {
+                            Codegen.emit_line(self, "    popl %ebx"); # base
+                            Codegen.emit_str(self, "    movl %eax, ");
+                            Codegen.emit_dec(self, elem_idx * 4);
+                            Codegen.emit_line(self, "(%ebx)");
+                            Codegen.emit_line(self, "    pushl %ebx"); # restore base
+                        } else {
+                            Codegen.emit_line(self, "    popq %r10"); # base
+                            Codegen.emit_str(self, "    movq %rax, ");
+                            Codegen.emit_dec(self, elem_idx * 8);
+                            Codegen.emit_line(self, "(%r10)");
+                            Codegen.emit_line(self, "    pushq %r10"); # restore base
+                        }
+                    }
+                    elem_idx is elem_idx + 1;
+                    if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen.tok_punct1(self, *pos, 44) == 1) {
+                        *pos is *pos + 1;
+                        continue;
+                    }
+                    break;
+                }
+                if (VecToken.get_kind(self->toks, *pos) != TK_PUNCT || Codegen.tok_punct1(self, *pos, 125) == 0) { Codegen.error_at(self, "expected '}'", *pos); }
+                *pos is *pos + 1; # '}'
+            }
+
+            if (self->emit == 1) {
+                if (self->bitness == 32) { Codegen.emit_line(self, "    popl %eax"); } # base as result
+                else { Codegen.emit_line(self, "    popq %rax"); } # base as result
+            }
+            return TY_ARRAY;
+        }
+
         if (k == TK_PUNCT && Codegen.tok_punct1(self, *pos, 40) == 1) {
             *pos is *pos + 1;
             ty is Codegen.parse_expr(self, pos);
@@ -2135,8 +2240,18 @@ class Codegen {
         }
 
         final_ty is expr_ty;
-        if (ty_decl != 0) { final_ty is ty_decl; }
-        if (ty_decl != 0 && expr_ty != ty_decl) { cg_error("type mismatch"); }
+        if (ty_decl != 0) {
+            if (expr_ty != ty_decl) {
+                # Allow `int x is [n]{...}` to bind an int[] (array) variable.
+                if (ty_decl == TY_INT && expr_ty == TY_ARRAY) {
+                    final_ty is TY_ARRAY;
+                } else {
+                    cg_error("type mismatch");
+                }
+            } else {
+                final_ty is ty_decl;
+            }
+        }
 
 	        vidx is Codegen.vars_find(self, ns, nl);
 	        if (vidx < 0) {
@@ -2181,6 +2296,61 @@ class Codegen {
         if (*pos >= end) { return; }
         if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT && Codegen.tok_punct1(self, *pos, 59) == 1) {
             *pos is *pos + 1;
+            return;
+        }
+        # Array element assignment: arr[idx] is expr;
+        if (*pos + 2 < end &&
+            *pos + 2 < self->tok_count &&
+            VecToken.get_kind(self->toks, *pos) == TK_IDENT &&
+            VecToken.get_kind(self->toks, *pos + 1) == TK_PUNCT &&
+            Codegen.tok_punct1(self, *pos + 1, 91) == 1) {
+            arr_start is VecToken.get_start(self->toks, *pos);
+            arr_len is VecToken.get_len(self->toks, *pos);
+            vidx is Codegen.vars_find(self, arr_start, arr_len);
+            if (vidx < 0) { Codegen.error_at(self, "unknown array", *pos); }
+            arr_ty is Codegen.vars_get_type(self, vidx);
+            if (arr_ty != TY_ARRAY) { Codegen.error_at(self, "indexed assignment on non-array", *pos); }
+
+            *pos is *pos + 2; # ident + '['
+            ity is Codegen.parse_expr(self, pos);
+            if (ity != TY_INT) { cg_error("index expects int"); }
+            if (VecToken.get_kind(self->toks, *pos) != TK_PUNCT || Codegen.tok_punct1(self, *pos, 93) == 0) { Codegen.error_at(self, "expected ']'", *pos); }
+            *pos is *pos + 1; # ']'
+
+            if (Codegen.tok_is_is(self, *pos) == 0) { cg_error("expected 'is'"); }
+            *pos is *pos + 1;
+
+            if (self->emit == 1) {
+                if (self->bitness == 32) {
+                    Codegen.emit_line(self, "    pushl %eax"); # index
+                } else {
+                    Codegen.emit_line(self, "    pushq %rax"); # index
+                }
+            }
+
+            rhs_ty is Codegen.parse_expr(self, pos);
+            if (rhs_ty != TY_INT) { cg_error("array element expects int"); }
+            if (Codegen.tok_punct1(self, *pos, 59) == 0) { Codegen.error_at(self, "expected ';'", *pos); }
+            *pos is *pos + 1;
+
+            if (self->emit == 1) {
+                off is Codegen.vars_get_off(self, vidx);
+                if (self->bitness == 32) {
+                    Codegen.emit_line(self, "    popl %ecx"); # index
+                    Codegen.emit_str(self, "    movl -");
+                    Codegen.emit_dec(self, off);
+                    Codegen.emit_line(self, "(%ebp), %ebx"); # base
+                    Codegen.emit_str(self, "    movl %eax, ");
+                    Codegen.emit_line(self, "(%ebx,%ecx,4)");
+                } else {
+                    Codegen.emit_line(self, "    popq %rcx"); # index
+                    Codegen.emit_str(self, "    movq -");
+                    Codegen.emit_dec(self, off);
+                    Codegen.emit_line(self, "(%rbp), %r10"); # base
+                    Codegen.emit_str(self, "    movq %rax, ");
+                    Codegen.emit_line(self, "(%r10,%rcx,8)");
+                }
+            }
             return;
         }
         # Pointer store statement: `*p is expr;`
