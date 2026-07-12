@@ -22,6 +22,7 @@ private int TK_NUMBER is 2;
 private int TK_STRING is 3;
 private int TK_PUNCT is 4;
 private int TK_MATCH is 31;
+private int TK_CHAR_LITERAL is 47;
 private int TK_CASE is 29;
 private int TK_DEFAULT is 30;
 
@@ -628,6 +629,15 @@ class Codegen {
                Codegen.byte_at(self, s + 2) == 108 &&
                Codegen.byte_at(self, s + 3) == 115 &&
                Codegen.byte_at(self, s + 4) == 101;
+    }
+    func int tok_is_asm(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 3) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 97 &&
+               Codegen.byte_at(self, s + 1) == 115 &&
+               Codegen.byte_at(self, s + 2) == 109;
     }
 
     func int tok_is_txtin(int* self, int pos) {
@@ -1248,6 +1258,26 @@ class Codegen {
             if (self->emit == 1) { Codegen.emit_line_bitness(self, "    negq %rax", "    negl %eax"); }
             return TY_INT;
         }
+        # Handle prefix ++ and -- (as standalone statements: ++i / --i)
+        if (Codegen.tok_punct2(self, *pos, 43, 43) == 1) {
+            *pos is *pos + 1;
+            # Parse the operand as unary again (so ++*p works)
+            ty is Codegen.parse_unary(self, pos);
+            if (ty != TY_INT) { cg_error("++ expects int"); }
+            if (self->emit == 1) {
+                Codegen.emit_line_bitness(self, "    addq $1, %rax", "    addl $1, %eax");
+            }
+            return TY_INT;
+        }
+        if (Codegen.tok_punct2(self, *pos, 45, 45) == 1) {
+            *pos is *pos + 1;
+            ty is Codegen.parse_unary(self, pos);
+            if (ty != TY_INT) { cg_error("-- expects int"); }
+            if (self->emit == 1) {
+                Codegen.emit_line_bitness(self, "    subq $1, %rax", "    subl $1, %eax");
+            }
+            return TY_INT;
+        }
         return Codegen.parse_primary(self, pos);
     }
 
@@ -1302,6 +1332,33 @@ class Codegen {
             }
             *pos is *pos + 1;
             return TY_STRING;
+        }
+        if (k == TK_CHAR_LITERAL) {
+            # Char literal: extract the character value from the source
+            start is VecToken.get_start(self->toks, *pos);
+            ln is VecToken.get_len(self->toks, *pos);
+            # Format: 'x' or '\n' etc. - extract the inner character
+            inner_start is start + 1;
+            inner_len is ln - 2;
+            cval is 0;
+            if (inner_len == 1) {
+                cval is Codegen.byte_at(self, inner_start);
+            } else if (inner_len == 2 && Codegen.byte_at(self, inner_start) == 92) {
+                esc is Codegen.byte_at(self, inner_start + 1);
+                if (esc == 110) { cval is 10; }
+                else if (esc == 116) { cval is 9; }
+                else if (esc == 48) { cval is 0; }
+                else if (esc == 92) { cval is 92; }
+                else if (esc == 39) { cval is 39; }
+                else if (esc == 34) { cval is 34; }
+                else { cval is esc; }
+            }
+            if (self->emit == 1) {
+                if (self->bitness == 32) { Codegen.emit_line_num(self, "    movl $", cval, ", %eax"); }
+                else { Codegen.emit_line_num(self, "    movq $", cval, ", %rax"); }
+            }
+            *pos is *pos + 1;
+            return TY_INT;
         }
         if (k == TK_IDENT) {
             if (Codegen.tok_is_true(self, *pos) == 1) {
@@ -1621,6 +1678,22 @@ class Codegen {
 	                    else { base_ty is TY_INT; }
 	                    continue;
 	                }
+
+                # postfix ++ and --
+                if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT &&
+                    (Codegen.tok_punct2(self, *pos, 43, 43) == 1 || Codegen.tok_punct2(self, *pos, 45, 45) == 1)) {
+                    is_inc is Codegen.tok_punct2(self, *pos, 43, 43);
+                    *pos is *pos + 1;
+                    if (base_ty != TY_INT) { cg_error("++/-- expects int"); }
+                    if (self->emit == 1) {
+                        if (is_inc == 1) {
+                            Codegen.emit_line_bitness(self, "    addq $1, %rax", "    addl $1, %eax");
+                        } else {
+                            Codegen.emit_line_bitness(self, "    subq $1, %rax", "    subl $1, %eax");
+                        }
+                    }
+                    continue;
+                }
 
                 break;
             }
@@ -2219,6 +2292,84 @@ class Codegen {
         }
 
         if (VecToken.get_kind(self->toks, *pos) != TK_IDENT) { cg_error("expected statement"); }
+
+        # Inline assembly: asm { ... }
+        if (Codegen.tok_is_asm(self, *pos) == 1) {
+            *pos is *pos + 1;
+            if (VecToken.get_kind(self->toks, *pos) != TK_PUNCT || Codegen.tok_punct1(self, *pos, 123) == 0) {
+                Codegen.error_at(self, "expected '{' after asm", *pos);
+            }
+            asm_lbrace is *pos;
+            *pos is *pos + 1;
+            asm_body_start is *pos;
+
+            depth is 1;
+            while (*pos < self->tok_count && depth > 0) {
+                if (VecToken.get_kind(self->toks, *pos) == TK_PUNCT) {
+                    if (Codegen.tok_punct1(self, *pos, 123) == 1) { depth is depth + 1; }
+                    else if (Codegen.tok_punct1(self, *pos, 125) == 1) { depth is depth - 1; }
+                }
+                *pos is *pos + 1;
+            }
+            if (depth != 0) { cg_error("unterminated asm block"); }
+            asm_rbrace is *pos - 1;
+
+            # Emit the raw assembly text between { and }, with variable substitution
+            if (self->emit == 1) {
+                asm_start_byte is VecToken.get_start(self->toks, asm_lbrace);
+                asm_end_byte is VecToken.get_start(self->toks, asm_rbrace) + VecToken.get_len(self->toks, asm_rbrace);
+                # Extract the text between the braces (exclusive)
+                inner_start is asm_start_byte + 1;
+                inner_end is asm_end_byte - 1;
+                # Emit each line with variable substitution
+                line_start is inner_start;
+                for (int bi is inner_start; bi <= inner_end; bi is bi + 1) {
+                    if (bi == inner_end || Codegen.byte_at(self, bi) == 10) {
+                        line_len is bi - line_start;
+                        if (line_len > 0) {
+                            Codegen.emit_str(self, "    ");
+                            # Scan the line for identifiers and substitute known variables
+                            si is line_start;
+                            si_end is line_start + line_len;
+                            while (si < si_end) {
+                                c is Codegen.byte_at(self, si);
+                                # Check if this starts an identifier (alpha or underscore or dot)
+                                if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 46) {
+                                    id_start is si;
+                                    si is si + 1;
+                                    while (si < si_end) {
+                                        c2 is Codegen.byte_at(self, si);
+                                        if ((c2 >= 97 && c2 <= 122) || (c2 >= 65 && c2 <= 90) ||
+                                            (c2 >= 48 && c2 <= 57) || c2 == 95 || c2 == 46) { si is si + 1; }
+                                        else { break; }
+                                    }
+                                    id_len is si - id_start;
+                                    # Look up as a local variable
+                                    vidx is Codegen.vars_find(self, id_start, id_len);
+                                    if (vidx >= 0) {
+                                        off is Codegen.vars_get_off(self, vidx);
+                                        # Emit Intel-syntax stack reference: [rbp - OFF]
+                                        Codegen.emit_str(self, "QWORD PTR [rbp - ");
+                                        Codegen.emit_dec(self, off);
+                                        Codegen.emit_byte(self, 93); # ']'
+                                    } else {
+                                        # Not a local variable, emit as-is
+                                        file_write(self->fd, self->src + id_start, id_len);
+                                    }
+                                } else {
+                                    # Non-identifier character, emit as-is
+                                    Codegen.emit_byte(self, c);
+                                    si is si + 1;
+                                }
+                            }
+                            Codegen.emit_nl(self);
+                        }
+                        line_start is bi + 1;
+                    }
+                }
+            }
+            return;
+        }
 
         if (Codegen.tok_is_if(self, *pos) == 1) {
             *pos is *pos + 1;

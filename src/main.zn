@@ -483,7 +483,7 @@ func string build_combined_source(string entry_path) {
 
 func int main(int argc, char *argv[]) {
     if (argc < 2) {
-        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--compile-for=ELF|x86-64] [--bitness=16|32|64]");
+        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--compile-for=ELF|x86-64] [--bitness=16|32|64] [-PIE]");
         out(1);
     }
 
@@ -496,6 +496,7 @@ func int main(int argc, char *argv[]) {
     emit_asm is 0;
     compile_for is "ELF"; # default to native platform; supported values: ELF, raw x86-64
     bitness is 64; # default to native platform; supported values: 16, 32, 64
+    pie is 0; # default to no PIE
 
     # Target selection (resolved after CLI parsing).
     # kind: 0 = ELF executable, 1 = raw x86-64 flat binary (via objcopy)
@@ -569,6 +570,12 @@ func int main(int argc, char *argv[]) {
             i is i + 2;
             continue;
         }
+        if (streq(argv[i], "-PIE")) {
+            # use linker -fPIE
+            pie is 1;
+            i is i + 1;
+            continue;
+        }
         if (len(input) == 0) {
             input is argv[i];
             i is i + 1;
@@ -596,7 +603,11 @@ func int main(int argc, char *argv[]) {
         }
     }
     if (target_kind == 1 && bitness != 64) {
-        txtout("--compile-for=x86-64 requires --bitness=64");
+        if (pie == 1) {
+            txtout("--compile-for=x86-64 requires --bitness=64 (PIE not supported for raw x86-64)");
+        } else {
+            txtout("--compile-for=x86-64 requires --bitness=64");
+        }
         out(1);
     }
 
@@ -670,7 +681,13 @@ func int main(int argc, char *argv[]) {
     if (target_kind == 0) {
         string cmd is "";
         if (bitness == 32) { cmd is str_concat4("cc -m32 -no-pie ", asm_path, " -o ", link_out); }
-        else { cmd is str_concat4("cc ", asm_path, " -o ", link_out); }
+        else {
+            if (pie == 1) {
+                cmd is str_concat4("cc -fPIE ", asm_path, " -o ", link_out);
+            } else {
+                cmd is str_concat4("cc ", asm_path, " -o ", link_out);
+            }
+        }
         dbg_s("link cmd=", cmd);
         rc is rt_system(cmd);
         free(cmd);

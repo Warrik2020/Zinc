@@ -20,6 +20,7 @@ Read the [wiki](https://github.com/Warrik2020/Zinc/wiki) for more info!
 
 ## Installation
 
+Since the language is programmed with itself, you will to download the latest build!
 You need to have GCC installed for the linker!
 
 ```bash
