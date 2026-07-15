@@ -55,6 +55,7 @@ private int TK_NULLPTR is 44;
 private int TK_CLASS is 45;
 private int TK_ASM is 46;
 private int TK_CHAR_LITERAL is 47;
+private int TK_EXTERN is 48;
 
 func bool is_hex_digit(int c) {
     if (c >= 48 && c <= 57) { return true; } # 0-9
@@ -107,6 +108,7 @@ func int keyword_lookup(string text) {
     if (text == "nullptr") { return TK_NULLPTR; }
     if (text == "class") { return TK_CLASS; }
     if (text == "asm") { return TK_ASM; }
+    if (text == "extern") { return TK_EXTERN; }
     return TK_IDENT;
 }
 

@@ -1,10 +1,8 @@
 .section .data
-fmt_int: .string "%ld"
+fmt_int: .string "%d"
 fmt_str: .string "%s"
 fmt_nl: .string "\n"
-str_0: .string "true"
-str_1: .string "false"
-str_2: .string "Hello from assembly!\\n"
+str_0: .string "Hello, Zinc!"
 
 .section .text
 .globl __zinc_rt_exit
@@ -20,271 +18,130 @@ str_2: .string "Hello from assembly!\\n"
 .globl txtin
 
 __zinc_rt_exit:
-    pushq %rbp
-    movq %rsp, %rbp
-    movq %rdi, %rbx
-    xorq %rdi, %rdi
+    pushl %ebp
+    movl %esp, %ebp
+    subl $12, %esp
+    pushl $0
     call fflush@PLT
-    movq %rbx, %rdi
+    addl $16, %esp
+    subl $12, %esp
+    pushl 8(%ebp)
     call _exit@PLT
+    addl $16, %esp
 
 __zinc_rt_free:
-    pushq %rbp
-    movq %rsp, %rbp
-    call free@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp free@PLT
 
 __zinc_rt_malloc:
-    pushq %rbp
-    movq %rsp, %rbp
-    call malloc@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp malloc@PLT
 
 __zinc_rt_memset:
-    pushq %rbp
-    movq %rsp, %rbp
-    call memset@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp memset@PLT
 
 __zinc_rt_memcpy:
-    pushq %rbp
-    movq %rsp, %rbp
-    call memcpy@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp memcpy@PLT
 
 __zinc_rt_strcmp:
-    pushq %rbp
-    movq %rsp, %rbp
-    call strcmp@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp strcmp@PLT
 
 __zinc_rt_strdup:
-    pushq %rbp
-    movq %rsp, %rbp
-    call strdup@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp strdup@PLT
 
 __zinc_rt_printf:
-    pushq %rbp
-    movq %rsp, %rbp
-    call printf@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp printf@PLT
 
 __zinc_rt_fgets:
-    pushq %rbp
-    movq %rsp, %rbp
-    call fgets@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp fgets@PLT
 
 __zinc_rt_strlen:
-    pushq %rbp
-    movq %rsp, %rbp
-    call strlen@PLT
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    jmp strlen@PLT
 
 txtin:
-    pushq %rbp
-    movq %rsp, %rbp
-    pushq %rbx
-    movl $1024, %edi
+    pushl %ebp
+    movl %esp, %ebp
+    subl $12, %esp
+    pushl $1
     call malloc@PLT
-    movq %rax, %rbx
-    testq %rbx, %rbx
-    je .Ltxtin_ret0
-    xorl %edi, %edi
-    movq %rbx, %rsi
-    movl $1023, %edx
-    call read@PLT
-    cmpq $0, %rax
-    jg .Ltxtin_got
-    movb $0, (%rbx)
-    movq %rbx, %rax
-    jmp .Ltxtin_done
-.Ltxtin_got:
-    movq %rax, %rcx
-    movb $0, (%rbx,%rcx,1)
-    decq %rcx
-    js .Ltxtin_ok
-    movb (%rbx,%rcx,1), %al
-    cmpb $10, %al
-    je .Ltxtin_strip
-    cmpb $13, %al
-    jne .Ltxtin_ok
-.Ltxtin_strip:
-    movb $0, (%rbx,%rcx,1)
-.Ltxtin_ok:
-    movq %rbx, %rax
-    jmp .Ltxtin_done
-.Ltxtin_ret0:
-    xorq %rax, %rax
-.Ltxtin_done:
-    popq %rbx
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    addl $16, %esp
+    testl %eax, %eax
+    je .Ltxtin32_ret0
+    movb $0, (%eax)
+    jmp .Ltxtin32_done
+.Ltxtin32_ret0:
+    xorl %eax, %eax
+.Ltxtin32_done:
+    movl %ebp, %esp
+    popl %ebp
+    ret
 
 
-.globl booltostring
-booltostring:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $16, %rsp
-    movq %rdi, -8(%rbp)
-    movq -8(%rbp), %rax
-    testq %rax, %rax
-    jz .L10
-    leaq str_0(%rip), %rax
+.globl add
+add:
+    pushl %ebp
+    movl %esp, %ebp
+    pushl %ebx
+    subl $20, %esp
+    movl 8(%ebp), %eax
+    movl %eax, -4(%ebp)
+    movl 12(%ebp), %eax
+    movl %eax, -8(%ebp)
+    movl -4(%ebp), %eax
+    pushl %eax
+    movl -8(%ebp), %eax
+    popl %ebx
+    addl %ebx, %eax
     jmp .Lret_0
-    jmp .L11
-.L10:
-    leaq str_1(%rip), %rax
-    jmp .Lret_0
-.L11:
-    xorq %rax, %rax
+    xorl %eax, %eax
 .Lret_0:
-    movq %rbp, %rsp
-    popq %rbp
-    retq
-
-.globl len
-len:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $16, %rsp
-    movq %rdi, -8(%rbp)
-    movq $0, %rax
-    movq %rax, -16(%rbp)
-.L12:
-    movq -8(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    movq %rax, %rcx
-    popq %rax
-    leaq (%rax,%rcx,1), %rax
-    movzbq (%rax), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %r10
-    cmpq %rax, %r10
-    setne %al
-    movzbl %al, %eax
-    testq %rax, %rax
-    jz .L13
-    movq -16(%rbp), %rax
-    addq $1, %rax
-    jmp .L12
-.L13:
-    movq -16(%rbp), %rax
-    jmp .Lret_3
-    xorq %rax, %rax
-.Lret_3:
-    movq %rbp, %rsp
-    popq %rbp
-    retq
-
-.globl asmfunc
-asmfunc:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $16, %rsp
-    leaq str_2(%rip), %rax
-    movq %rax, -8(%rbp)
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call len
-    movq %rax, -16(%rbp)
-     # print test message to console
-            .intel_syntax noprefix
-            mov rax, 1
-            mov rdi, 1
-            lea rsi, QWORD PTR [rbp - 8]
-            mov rdx, QWORD PTR [rbp - 16]
-            syscall
-            .att_syntax prefix
-        
-    xorq %rax, %rax
-.Lret_6:
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    addl $20, %esp
+    popl %ebx
+    movl %ebp, %esp
+    popl %ebp
+    ret
 
 .globl main
 main:
-    pushq %rbp
-    movq %rsp, %rbp
-    subq $32, %rsp
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)
-    movq -8(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %r10
-    cmpq %rax, %r10
-    setg %al
-    movzbl %al, %eax
-    testq %rax, %rax
-    jz .L14
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    movq %rax, %rcx
-    popq %rax
-    leaq (%rax,%rcx,8), %rax
-    movq (%rax), %rax
-    movq %rax, %rsi
-    leaq fmt_str(%rip), %rdi
-    xorl %eax, %eax
+    pushl %ebp
+    movl %esp, %ebp
+    pushl %ebx
+    subl $4, %esp
+    movl $str_0, %eax
+    subl $8, %esp
+    pushl %eax
+    pushl $fmt_str
     call __zinc_rt_printf
-    leaq fmt_nl(%rip), %rdi
-    xorl %eax, %eax
+    addl $16, %esp
+    subl $12, %esp
+    pushl $fmt_nl
     call __zinc_rt_printf
-    jmp .L15
-.L14:
-.L15:
-    movq -8(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %r10
-    cmpq %rax, %r10
-    setg %al
-    movzbl %al, %eax
-    movq %rax, -24(%rbp)
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call booltostring
-    movq %rax, %rsi
-    leaq fmt_str(%rip), %rdi
-    xorl %eax, %eax
+    addl $16, %esp
+    movl $5, %eax
+    pushl %eax
+    movl $3, %eax
+    pushl %eax
+    subl $8, %esp
+    call add
+    addl $16, %esp
+    movl %eax, -4(%ebp)
+    movl -4(%ebp), %eax
+    subl $8, %esp
+    pushl %eax
+    pushl $fmt_int
     call __zinc_rt_printf
-    leaq fmt_nl(%rip), %rdi
-    xorl %eax, %eax
+    addl $16, %esp
+    subl $12, %esp
+    pushl $fmt_nl
     call __zinc_rt_printf
-    call asmfunc
-    movq $0, %rax
-    movq %rax, %rdi
+    addl $16, %esp
+    movl $0, %eax
+    subl $12, %esp
+    pushl %eax
     call __zinc_rt_exit
-    xorq %rax, %rax
-.Lret_7:
-    movq %rbp, %rsp
-    popq %rbp
-    retq
+    addl $16, %esp
+    xorl %eax, %eax
+.Lret_1:
+    addl $4, %esp
+    popl %ebx
+    movl %ebp, %esp
+    popl %ebp
+    ret

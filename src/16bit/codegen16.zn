@@ -222,6 +222,7 @@ class Codegen16 {
     func int tok_is_txtout_nl(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "txtout_nl"); }
     func int tok_is_out(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "out"); }
     func int tok_is_main(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "main"); }
+    func int tok_is_extern(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "extern"); }
     func int tok_is_match_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "match"); }
     func int tok_is_case_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "case"); }
     func int tok_is_default_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "default"); }
@@ -1828,6 +1829,32 @@ class Codegen16 {
                 }
                 VecInt.set(enums, enum_idx * 4 + 3, variantc);
                 pos is body_rbrace + 1;
+                continue;
+            }
+
+            # Skip extern function declarations (no body needed, linker resolves)
+            if (Codegen16.tok_is_extern(self, pos) == 1) {
+                if (pos + 1 >= self->tok_count) { cg16_error("expected func after extern"); }
+                if (Codegen16.tok_is_func(self, pos + 1) == 0) { cg16_error("extern requires func"); }
+                # extern func <ret> <name>(params);
+                p is pos + 2;
+                if (VecToken.get_kind(self->toks, p) != TK_IDENT) { cg16_error("expected return type"); }
+                p is p + 1;
+                if (VecToken.get_kind(self->toks, p) != TK_IDENT) { cg16_error("expected function name"); }
+                p is p + 1;
+                if (VecToken.get_kind(self->toks, p) != TK_PUNCT || Codegen16.tok_punct1(self, p, 40) == 0) { cg16_error("expected '('"); }
+                p is p + 1;
+                depth is 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen16.tok_punct1(self, p, 40) == 1) { depth is depth + 1; }
+                        else if (Codegen16.tok_punct1(self, p, 41) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg16_error("unterminated param list"); }
+                if (VecToken.get_kind(self->toks, p) != TK_PUNCT || Codegen16.tok_punct1(self, p, 59) == 0) { cg16_error("expected ';' after extern func"); }
+                pos is p + 1;
                 continue;
             }
 

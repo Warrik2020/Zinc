@@ -105,6 +105,31 @@ func string str_concat4(string a, string b, string c, string d) {
 
 func int rt_system(string cmd) { return system(cmd); }
 
+# Convert comma-separated library names to -l flags for the linker.
+# e.g. "m,pthread" -> " -lm -lpthread"
+func string link_libs_to_flags(string libs) {
+    if (len(libs) == 0) { return zn_strdup_copy(""); }
+    n is len(libs);
+    out is "";
+    out_owned is 0;
+    i is 0;
+    while (i < n) {
+        start is i;
+        while (i < n && libs[i] != 44) { i is i + 1; }
+        lib_name is zn_substr_copy(libs, start, i - start);
+        string flag is str_concat2(" -l", lib_name);
+        free(lib_name);
+        string tmp is str_concat2(out, flag);
+        if (out_owned == 1) { free(out); }
+        free(flag);
+        out is tmp;
+        out_owned is 1;
+        if (i < n && libs[i] == 44) { i is i + 1; }
+    }
+    if (out_owned == 0) { out is zn_strdup_copy(""); out_owned is 1; }
+    return out;
+}
+
 func int is_space_byte(int c) { return c == 32 || c == 9 || c == 13 || c == 10; }
 
 func int ltrim_idx(string s, int start, int end) {
@@ -483,7 +508,7 @@ func string build_combined_source(string entry_path) {
 
 func int main(int argc, char *argv[]) {
     if (argc < 2) {
-        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--compile-for=ELF|x86-64] [--bitness=16|32|64] [-PIE]");
+        txtout("usage: znc <file.zn> [--compile] [--emit-asm] [-S out.s] [-o out] [--dump-tokens] [--compile-for=ELF|x86-64] [--bitness=16|32|64] [-PIE] [--link lib1,lib2,...]");
         out(1);
     }
 
@@ -497,6 +522,7 @@ func int main(int argc, char *argv[]) {
     compile_for is "ELF"; # default to native platform; supported values: ELF, raw x86-64
     bitness is 64; # default to native platform; supported values: 16, 32, 64
     pie is 0; # default to no PIE
+    link_libs is ""; # comma-separated list of libraries to link
 
     # Target selection (resolved after CLI parsing).
     # kind: 0 = ELF executable, 1 = raw x86-64 flat binary (via objcopy)
@@ -576,6 +602,13 @@ func int main(int argc, char *argv[]) {
             i is i + 1;
             continue;
         }
+        if (streq(argv[i], "--link")) {
+            if (i + 1 >= argc) { txtout("missing libraries after --link"); out(1); }
+            link_libs is argv[i + 1];
+            dump_toks is 0;
+            i is i + 2;
+            continue;
+        }
         if (len(input) == 0) {
             input is argv[i];
             i is i + 1;
@@ -590,6 +623,8 @@ func int main(int argc, char *argv[]) {
         target_kind is 0;
     } else if (streq(compile_for, "x86-64")) {
         target_kind is 1;
+    } else if (streq(compile_for, "x86")) {
+        target_kind is 2;
     } else {
         txtout("unsupported --compile-for: ", compile_for);
         out(1);
@@ -608,6 +643,10 @@ func int main(int argc, char *argv[]) {
         } else {
             txtout("--compile-for=x86-64 requires --bitness=64");
         }
+        out(1);
+    }
+    if (target_kind == 2 && bitness != 32) {
+        txtout("--compile-for=x86 requires --bitness=32");
         out(1);
     }
 
@@ -678,6 +717,9 @@ func int main(int argc, char *argv[]) {
         free(stem);
     }
 
+    # Convert --link libraries to -l flags
+    string lib_flags is link_libs_to_flags(link_libs);
+
     if (target_kind == 0) {
         string cmd is "";
         if (bitness == 32) { cmd is str_concat4("cc -m32 -no-pie ", asm_path, " -o ", link_out); }
@@ -688,6 +730,12 @@ func int main(int argc, char *argv[]) {
                 cmd is str_concat4("cc ", asm_path, " -o ", link_out);
             }
         }
+        # Append library flags if any
+        if (len(lib_flags) > 0) {
+            string tmp is str_concat2(cmd, lib_flags);
+            free(cmd);
+            cmd is tmp;
+        }
         dbg_s("link cmd=", cmd);
         rc is rt_system(cmd);
         free(cmd);
@@ -695,16 +743,29 @@ func int main(int argc, char *argv[]) {
         if (rc != 0) {
             txtout("link failed");
             if (is_out_dir == 1) { free(link_out); }
+            free(lib_flags);
             out(1);
         }
         txtout("Built: ", link_out);
         if (is_out_dir == 1) { free(link_out); }
     } else {
-        # Raw x86-64: link an ELF, then extract a flat binary.
+        # Raw flat binary: link an ELF, then extract a flat binary via objcopy.
         string tmp_elf is str_concat2(link_out, ".elf");
 
         string link_cmd is "";
-        link_cmd is str_concat4("cc ", asm_path, " -o ", tmp_elf);
+        if (target_kind == 2) {
+            # Raw x86 (32-bit): use -m32 -no-pie
+            link_cmd is str_concat4("cc -m32 -no-pie ", asm_path, " -o ", tmp_elf);
+        } else {
+            # Raw x86-64 (64-bit)
+            link_cmd is str_concat4("cc ", asm_path, " -o ", tmp_elf);
+        }
+        # Append library flags if any
+        if (len(lib_flags) > 0) {
+            string tmp is str_concat2(link_cmd, lib_flags);
+            free(link_cmd);
+            link_cmd is tmp;
+        }
         dbg_s("link cmd=", link_cmd);
         rc is rt_system(link_cmd);
         free(link_cmd);
@@ -713,6 +774,7 @@ func int main(int argc, char *argv[]) {
             txtout("link failed");
             free(tmp_elf);
             if (is_out_dir == 1) { free(link_out); }
+            free(lib_flags);
             out(1);
         }
 
@@ -730,5 +792,6 @@ func int main(int argc, char *argv[]) {
         txtout("Built: ", link_out);
         if (is_out_dir == 1) { free(link_out); }
     }
+    free(lib_flags);
     out(0);
 }

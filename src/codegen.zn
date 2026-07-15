@@ -641,6 +641,19 @@ class Codegen {
                Codegen.byte_at(self, s + 2) == 109;
     }
 
+    func int tok_is_extern(int* self, int pos) {
+        if (pos < 0 || pos >= self->tok_count) { return 0; }
+        if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
+        if (VecToken.get_len(self->toks, pos) != 6) { return 0; }
+        s is VecToken.get_start(self->toks, pos);
+        return Codegen.byte_at(self, s + 0) == 101 &&
+               Codegen.byte_at(self, s + 1) == 120 &&
+               Codegen.byte_at(self, s + 2) == 116 &&
+               Codegen.byte_at(self, s + 3) == 101 &&
+               Codegen.byte_at(self, s + 4) == 114 &&
+               Codegen.byte_at(self, s + 5) == 110;
+    }
+
     func int tok_is_txtin(int* self, int pos) {
         if (pos < 0 || pos >= self->tok_count) { return 0; }
         if (VecToken.get_kind(self->toks, pos) != TK_IDENT) { return 0; }
@@ -3214,6 +3227,37 @@ class Codegen {
                     pos is p + 1;
                     continue;
                 }
+            }
+
+            # Skip extern function declarations (no body needed, linker resolves)
+            if (Codegen.tok_is_extern(self, pos) == 1) {
+                if (pos + 1 >= self->tok_count) { cg_error("expected func after extern"); }
+                if (Codegen.tok_is_func(self, pos + 1) == 0) { cg_error("extern requires func"); }
+                # extern func <ret> <name>(params);
+                # Skip: extern func ret name ( params ) ;
+                p is pos + 2;
+                # Skip return type
+                if (VecToken.get_kind(self->toks, p) != TK_IDENT) { cg_error("expected return type"); }
+                p is p + 1;
+                # Skip function name
+                if (VecToken.get_kind(self->toks, p) != TK_IDENT) { cg_error("expected function name"); }
+                p is p + 1;
+                # Skip param list
+                if (VecToken.get_kind(self->toks, p) != TK_PUNCT || Codegen.tok_punct1(self, p, 40) == 0) { cg_error("expected '('"); }
+                p is p + 1;
+                depth is 1;
+                while (p < self->tok_count && depth > 0) {
+                    if (VecToken.get_kind(self->toks, p) == TK_PUNCT) {
+                        if (Codegen.tok_punct1(self, p, 40) == 1) { depth is depth + 1; }
+                        else if (Codegen.tok_punct1(self, p, 41) == 1) { depth is depth - 1; }
+                    }
+                    p is p + 1;
+                }
+                if (depth != 0) { cg_error("unterminated param list"); }
+                # Skip semicolon
+                if (VecToken.get_kind(self->toks, p) != TK_PUNCT || Codegen.tok_punct1(self, p, 59) == 0) { cg_error("expected ';' after extern func"); }
+                pos is p + 1;
+                continue;
             }
 
             if (Codegen.tok_is_func(self, pos) == 1) {
