@@ -79,6 +79,7 @@ class Codegen16 {
     int methods;  # VecInt (stride 4)
     int enums;    # VecInt (stride 4)
     int enum_vals; # VecInt (stride 4)
+    int typedefs;  # VecInt (stride 3)
 
     int break_stack; # VecInt labels
     int cont_stack;  # VecInt labels
@@ -109,6 +110,7 @@ class Codegen16 {
         self->methods is 0;
         self->enums is 0;
         self->enum_vals is 0;
+        self->typedefs is 0;
 
         self->cur_fn_class_idx is -1;
         self->cur_self_off is 0;
@@ -210,11 +212,14 @@ class Codegen16 {
     func int tok_is_break(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "break"); }
     func int tok_is_continue(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "continue"); }
     func int tok_is_int_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "int"); }
+    func int tok_is_int32_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "int32"); }
+    func int tok_is_int16_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "int16"); }
     func int tok_is_string_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "string"); }
     func int tok_is_void_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "void"); }
     func int tok_is_class_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "class"); }
     func int tok_is_struct_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "struct"); }
     func int tok_is_enum_kw(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "enum"); }
+    func int tok_is_typedef(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "typedef"); }
     func int tok_is_true(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "true"); }
     func int tok_is_false(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "false"); }
     func int tok_is_nullptr(int* self, int pos) { return Codegen16.tok_is_lit(self, pos, "nullptr"); }
@@ -381,13 +386,40 @@ class Codegen16 {
         return -1;
     }
 
+    # Typedef table record stride = 3: name_start,name_len,ty
+    func int typedefs_count(int* self) {
+        if (self->typedefs == 0) { return 0; }
+        return VecInt.count(self->typedefs) / 3;
+    }
+    func int typedefs_get_name_start(int* self, int idx) { return VecInt.get(self->typedefs, idx * 3 + 0); }
+    func int typedefs_get_name_len(int* self, int idx) { return VecInt.get(self->typedefs, idx * 3 + 1); }
+    func int typedefs_get_type(int* self, int idx) { return VecInt.get(self->typedefs, idx * 3 + 2); }
+
+    func int typedef_find_by_name(int* self, int name_start, int name_len) {
+        n is Codegen16.typedefs_count(self);
+        for (int i is 0; i < n; i is i + 1) {
+            if (name_len != Codegen16.typedefs_get_name_len(self, i)) { continue; }
+            s is Codegen16.typedefs_get_name_start(self, i);
+            ok is 1;
+            for (int j is 0; j < name_len; j is j + 1) {
+                if (Codegen16.byte_at(self, s + j) != Codegen16.byte_at(self, name_start + j)) { ok is 0; break; }
+            }
+            if (ok == 1) { return i; }
+        }
+        return -1;
+    }
+
     func int type_ty_at(int* self, int pos) {
         if (Codegen16.tok_is_int_kw(self, pos) == 1) { return TY_INT; }
+        if (Codegen16.tok_is_int32_kw(self, pos) == 1) { return TY_INT; }
+        if (Codegen16.tok_is_int16_kw(self, pos) == 1) { return TY_INT; }
         if (Codegen16.tok_is_string_kw(self, pos) == 1) { return TY_STRING; }
         if (Codegen16.tok_is_void_kw(self, pos) == 1) { return TY_VOID; }
         if (VecToken.get_kind(self->toks, pos) == TK_IDENT) {
             ns is VecToken.get_start(self->toks, pos);
             nl is VecToken.get_len(self->toks, pos);
+            tidx is Codegen16.typedef_find_by_name(self, ns, nl);
+            if (tidx >= 0) { return Codegen16.typedefs_get_type(self, tidx); }
             cidx is Codegen16.class_find_by_name(self, ns, nl);
             if (cidx >= 0) { return TY_CLASS_BASE + cidx; }
             eidx is Codegen16.enum_find_by_name(self, ns, nl);
@@ -1400,7 +1432,7 @@ class Codegen16 {
         }
 
         # binding/assignment statement
-        if (Codegen16.tok_is_int_kw(self, *pos) == 1 || Codegen16.tok_is_string_kw(self, *pos) == 1 ||
+        if ((Codegen16.type_ty_at(self, *pos) != 0 && Codegen16.type_ty_at(self, *pos) != TY_VOID) ||
             (VecToken.get_kind(self->toks, *pos) == TK_IDENT && *pos + 1 < self->tok_count && Codegen16.tok_is_is(self, *pos + 1) == 1)) {
             Codegen16.parse_bind_assign(self, pos, 59, 1);
             return;
@@ -1644,12 +1676,14 @@ class Codegen16 {
         fields is VecInt(); VecInt.init(fields);
         enums is VecInt(); VecInt.init(enums);
         enum_vals is VecInt(); VecInt.init(enum_vals);
+        typedefs is VecInt(); VecInt.init(typedefs);
         self->fns is funcs;
         self->globals is globals;
         self->classes is classes;
         self->fields is fields;
         self->enums is enums;
         self->enum_vals is enum_vals;
+        self->typedefs is typedefs;
 
         func_locals is VecInt(); VecInt.init(func_locals);
         func_params is VecInt(); VecInt.init(func_params);
@@ -1658,6 +1692,24 @@ class Codegen16 {
         # Scan top-level for classes, methods, and funcs.
         pos is 0;
         while (pos < self->tok_count && VecToken.get_kind(self->toks, pos) != TK_EOF) {
+            if (Codegen16.tok_is_typedef(self, pos) == 1) {
+                if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg16_error("expected type after typedef"); }
+                ty is Codegen16.type_ty_at(self, pos + 1);
+                if (ty == 0) { Codegen16.error_at(self, "unknown typedef target type", pos + 1); }
+                if (VecToken.get_kind(self->toks, pos + 2) != TK_IDENT) { cg16_error("expected typedef name"); }
+                alias_start is VecToken.get_start(self->toks, pos + 2);
+                alias_len is VecToken.get_len(self->toks, pos + 2);
+                if (Codegen16.typedef_find_by_name(self, alias_start, alias_len) >= 0) { cg16_error("duplicate typedef"); }
+                if (VecToken.get_kind(self->toks, pos + 3) != TK_PUNCT || Codegen16.tok_punct1(self, pos + 3, 59) == 0) {
+                    Codegen16.error_at(self, "expected ';' after typedef", pos + 3);
+                }
+                VecInt.push(self->typedefs, alias_start);
+                VecInt.push(self->typedefs, alias_len);
+                VecInt.push(self->typedefs, ty);
+                pos is pos + 4;
+                continue;
+            }
+
             if (Codegen16.tok_is_class_kw(self, pos) == 1 || Codegen16.tok_is_struct_kw(self, pos) == 1) {
                 if (VecToken.get_kind(self->toks, pos + 1) != TK_IDENT) { cg16_error("expected class name"); }
                 cname_start is VecToken.get_start(self->toks, pos + 1);
@@ -2239,6 +2291,11 @@ class Codegen16 {
         self->fields is 0;
         self->enums is 0;
         self->enum_vals is 0;
+        if (self->typedefs != 0) {
+            VecInt.destroy(self->typedefs);
+            free(self->typedefs);
+            self->typedefs is 0;
+        }
     }
 }
 

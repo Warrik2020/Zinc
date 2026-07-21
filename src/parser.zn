@@ -334,6 +334,20 @@ class Parser {
                 continue;
             }
 
+            # Handle typedef declaration
+            if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, "typedef") == 1) {
+                Parser.advance(self);
+                if (Parser.cur_kind(self) == TK_IDENT) {
+                    Parser.advance(self);
+                    while (Parser.consume_punct(self, "*") == 1) { }
+                    if (Parser.cur_kind(self) == TK_IDENT) {
+                        Parser.advance(self);
+                    }
+                }
+                Parser.consume_punct(self, ";");
+                continue;
+            }
+
             # Handle func declaration
             if (Parser.cur_kind(self) == TK_IDENT && Parser.cur_text_eq(self, "func") == 1) {
                 Parser.parse_func(self);

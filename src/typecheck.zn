@@ -61,6 +61,8 @@ func int parse_type_from_text(string src, int type_start, int type_len) {
         t is substr(src, type_start, 5);
         if (t == "float") { free(t); return TYPE_FLOAT; }
         if (t == "false") { free(t); return TYPE_BOOL; }
+        if (t == "int32") { free(t); return TYPE_INT; }
+        if (t == "int16") { free(t); return TYPE_INT; }
         free(t);
     }
     if (type_len == 6) {

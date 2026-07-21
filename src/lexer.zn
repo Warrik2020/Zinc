@@ -55,7 +55,8 @@ private int TK_NULLPTR is 44;
 private int TK_CLASS is 45;
 private int TK_ASM is 46;
 private int TK_CHAR_LITERAL is 47;
-private int TK_EXTERN is 48;
+private int TK_TYPEDEF is 48;
+private int TK_EXTERN is 49;
 
 func bool is_hex_digit(int c) {
     if (c >= 48 && c <= 57) { return true; } # 0-9
@@ -68,6 +69,8 @@ func int keyword_lookup(string text) {
     # Keywords map to token types
     if (text == "func") { return TK_FUNC; }
     if (text == "int") { return TK_INT; }
+    if (text == "int32") { return TK_INT; }
+    if (text == "int16") { return TK_INT; }
     if (text == "float") { return TK_FLOAT; }
     if (text == "string") { return TK_STRING_TYPE; }
     if (text == "bool") { return TK_BOOL; }
@@ -101,6 +104,7 @@ func int keyword_lookup(string text) {
     if (text == "module") { return TK_MODULE; }
     if (text == "private") { return TK_PRIVATE; }
     if (text == "type") { return TK_TYPE; }
+    if (text == "typedef") { return TK_TYPEDEF; }
     if (text == "new") { return TK_NEW; }
     if (text == "delete") { return TK_DELETE; }
     if (text == "sizeof") { return TK_SIZEOF; }
